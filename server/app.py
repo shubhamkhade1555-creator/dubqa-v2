@@ -1,42 +1,27 @@
-"""FastAPI backend and web UI.
-
-GET  /                             web UI (upload, platform choice, live log, report link)
-GET  /api/platforms                platform names from config/vendors.yaml, in display order
-POST /api/runs                     multipart: manifest + media files (+ optional precomputed JSON), mode, use_judge
-GET  /api/runs/{run_id}            status (queued / running / done / failed)
-GET  /api/runs/{run_id}/log?offset=N   log text written after byte offset N, plus the next offset
-GET  /api/runs/{run_id}/results    results.json
-GET  /api/runs/{run_id}/report     HTML report
-GET  /api/runs/{run_id}/report/{p} report assets (media copies)
-"""
 import json
-import logging
-import os
-import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-
+from typing import Any
 import yaml
+
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from core import pipeline
 from core.manifest import ManifestError, load_manifest
 from report import build_html
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNS = Path(os.environ.get("RUNS_DIR", ROOT / "runs"))
-RUNS.mkdir(parents=True, exist_ok=True)
-RUN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{3,80}$")
-STATIC = Path(__file__).resolve().parent / "static"
+RUNS = ROOT / "runs"
+STATIC = ROOT / "server" / "static"
+RUN_ID_RE = pipeline.re.compile(r"^[A-Za-z0-9_\-]+$") if hasattr(pipeline, "re") else __import__("re").compile(r"^[A-Za-z0-9_\-]+$")
+MAX_LOG_CHUNK = 64 * 1024
 LOG_NAME = "run.log"
-MAX_LOG_CHUNK = 256 * 1024
 
-app = FastAPI(title="DubQA v2", version="2.0")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logging.getLogger("dubqa").setLevel(logging.INFO)
+app = FastAPI(title="DubQA v2", version="2.0.0")
+app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
 def _run_dir(run_id: str) -> Path:
@@ -48,18 +33,17 @@ def _run_dir(run_id: str) -> Path:
     return d
 
 
-class _ThreadFilter(logging.Filter):
-    """Only lines logged by this run's worker thread go into its run.log."""
-
+class _ThreadFilter(logging.Filter if "logging" in globals() else __import__("logging").Filter):
     def __init__(self, thread_name: str):
         super().__init__()
         self.thread_name = thread_name
 
-    def filter(self, record: logging.LogRecord) -> bool:
+    def filter(self, record):
         return record.threadName == self.thread_name
 
 
 def _job(run_dir: Path, mode: str, use_judge: bool, use_gemini: bool) -> None:
+    import logging
     thread_name = threading.current_thread().name
     handler = logging.FileHandler(run_dir / LOG_NAME, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -74,13 +58,22 @@ def _job(run_dir: Path, mode: str, use_judge: bool, use_gemini: bool) -> None:
             from core.qa_report_bundle import export_run_reports
             export_run_reports(run_dir)
             logging.getLogger("dubqa").info("excel and word reports built")
+            _update_meta(run_dir, report_status="success")
         except Exception as rep_err:
             logging.getLogger("dubqa").warning("excel/word report generation error: %s", rep_err)
+            _update_meta(run_dir, report_status="failed", report_error=str(rep_err))
     except Exception:
-        pass  # pipeline already wrote status=failed with the error, and the traceback is in run.log
+        pass
     finally:
         logger.removeHandler(handler)
         handler.close()
+
+
+def _update_meta(run_dir: Path, **kwargs) -> None:
+    p = run_dir / "run_meta.json"
+    meta = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    meta.update(kwargs)
+    p.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
 @app.get("/", include_in_schema=False)
@@ -113,7 +106,7 @@ async def create_run(manifest: UploadFile = File(...), files: list[UploadFile] =
     run_dir = RUNS / run_id
     if run_dir.exists():
         raise HTTPException(409, "run_id already exists")
-    for sub in ("inputs", "work", "measure", "judge", "precomputed", "report"):
+    for sub in ("inputs", "work", "measure", "judge", "precomputed", "report", "lips", "words"):
         (run_dir / sub).mkdir(parents=True, exist_ok=True)
     (run_dir / "manifest.json").write_bytes(raw)
     wanted = {data["source"]["file"], *(o["file"] for o in data["outputs"])}
@@ -148,16 +141,16 @@ def load_manifest_from_dict(data: dict) -> None:
 
 def _write_meta(run_dir: Path, status: str, **extra) -> None:
     p = run_dir / "run_meta.json"
-    meta = json.loads(p.read_text()) if p.exists() else {}
+    meta = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
     meta.update({"status": status}, **extra)
-    p.write_text(json.dumps(meta, indent=2))
+    p.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
 @app.get("/api/runs/{run_id}")
 def status(run_id: str):
     d = _run_dir(run_id)
     p = d / "run_meta.json"
-    return json.loads(p.read_text()) if p.exists() else {"status": "queued"}
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"status": "queued"}
 
 
 @app.get("/api/runs/{run_id}/log")
@@ -178,7 +171,7 @@ def results(run_id: str):
     p = _run_dir(run_id) / "results.json"
     if not p.exists():
         raise HTTPException(404, "results not ready")
-    return JSONResponse(json.loads(p.read_text()))
+    return JSONResponse(json.loads(p.read_text(encoding="utf-8")))
 
 
 @app.get("/api/runs/{run_id}/report")

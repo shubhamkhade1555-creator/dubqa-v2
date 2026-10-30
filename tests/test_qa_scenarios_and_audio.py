@@ -24,7 +24,9 @@ def test_audio_quality_measurement_synthetic(tmp_path):
     assert res["duration_s"] == 1.0
     assert res["sample_rate"] == 16000
     assert res["clipped_sample_ratio"] == 0.0
-    assert res["true_peak_dbtp"] < 0.0
+    assert res["sample_peak_dbfs"] < 0.0
+    assert res["rms_loudness_estimate_dbfs"] < 0.0
+    assert res["true_peak_dbtp"] == "NOT_MEASURED"
 
 
 def test_captions_parsing_and_evaluation(tmp_path):

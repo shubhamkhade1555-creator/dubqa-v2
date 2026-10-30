@@ -31,14 +31,16 @@ def _status(run_dir: Path, status: str, **extra) -> None:
     _write(meta_p, meta)
 
 
-def _words_and_lips(mode, run_dir, wav, video, pre_words, pre_lips, lang):
+def _words_and_lips(mode, run_dir, wav, video, pre_words, pre_lips, lang_code):
+    """Returns (words_dict, timestamps_array, opening_array, face_tracks_list)."""
     if mode == "precomputed":
         words = asr.load_words(pre_words)
         t, op = lips.load_precomputed(pre_lips)
+        face_tracks = []
     else:
-        words = asr.transcribe_words(wav, lang)
-        t, op = lips.track_video_mediapipe(video)
-    return words, t, op
+        words = asr.transcribe_words(wav, lang_code)
+        t, op, face_tracks = lips.track_faces_mediapipe(video, num_faces=3)
+    return words, t, op, face_tracks
 
 
 def run(run_dir: Path, mode: str = "precomputed", use_judge: bool = False, use_gemini: bool = True) -> dict:
@@ -53,13 +55,19 @@ def run(run_dir: Path, mode: str = "precomputed", use_judge: bool = False, use_g
         src_path = inputs / man["source"]["file"]
         src_info = media.probe(src_path)
         src_wav = media.extract_audio_wav(src_path, work / "source.wav")
-        src_words, t_s, op_s = _words_and_lips(
+        src_words, t_s, op_s, src_face_tracks = _words_and_lips(
             mode, run_dir, src_wav, src_path,
             pre / "source_words.json", pre / "source_lips.json", man["source"].get("lang"))
+
         # Persist extracted words and lips for full auditability
         _write(run_dir / "words" / "source_words.json", src_words)
-        _write(run_dir / "lips" / "source_lips.json", {"t": t_s.tolist() if hasattr(t_s, "tolist") else list(t_s),
-                                                       "opening": op_s.tolist() if hasattr(op_s, "tolist") else list(op_s)})
+        _write(run_dir / "lips" / "source_lips.json", {
+            "t": t_s.tolist() if hasattr(t_s, "tolist") else list(t_s),
+            "opening": op_s.tolist() if hasattr(op_s, "tolist") else list(op_s)
+        })
+        if src_face_tracks:
+            _write(run_dir / "lips" / "source_face_tracks.json", src_face_tracks)
+
         src_w = src_words["words"]
         src_sent = src_words.get("sentences", [])
         src_speech_s = _speech_total(src_wav)
@@ -72,15 +80,16 @@ def run(run_dir: Path, mode: str = "precomputed", use_judge: bool = False, use_g
         log.info("source language: %s (declared=%s, detected=%s via %s)", src_lang,
                  man["source"].get("lang"), src_det["lang"], src_det["method"])
 
-        results = {"run_id": man["run_id"], "mode": mode, "generated": datetime.now(timezone.utc).isoformat(),
-                   "thresholds_version": th["version"], "source": {**src_info, "file": src_path.name,
-                   "words": len(src_w), "speech_s": src_speech_s, "language": src_lang},
-                   "outputs": {}, "segments": [], "pairs": {}, "notes": [],
-                   "languages": {"source": {"declared": man["source"].get("lang"), "resolved": src_lang,
-                                            "detection": src_det, "notes": src_lang_notes}},
-                   "gemini_source": _gemini_brief(src_ext), "info": {},
-                   "required_data": ginfo.checklist(run_dir, man, mode, use_gemini)}
-        # segments = source sentences (shared by every output)
+        results = {
+            "run_id": man["run_id"], "mode": mode, "generated": datetime.now(timezone.utc).isoformat(),
+            "thresholds_version": th["version"], "source": {**src_info, "file": src_path.name,
+            "words": len(src_w), "speech_s": src_speech_s, "language": src_lang},
+            "outputs": {}, "segments": [], "pairs": {}, "notes": [],
+            "languages": {"source": {"declared": man["source"].get("lang"), "resolved": src_lang,
+                                     "detection": src_det, "notes": src_lang_notes}},
+            "gemini_source": _gemini_brief(src_ext), "info": {},
+            "required_data": ginfo.checklist(run_dir, man, mode, use_gemini)
+        }
         for i, s in enumerate(src_sent, start=1):
             results["segments"].append({"seg": i, "start": s["start"], "end": s["end"], "text": s["text"]})
 
@@ -93,12 +102,19 @@ def run(run_dir: Path, mode: str = "precomputed", use_judge: bool = False, use_g
             wav = media.extract_audio_wav(path, work / f"{oid}.wav")
             samples, sr = media.read_wav_mono(wav)
             speech = vad.speech_intervals(samples, sr)
-            dwords, t, op = _words_and_lips(mode, run_dir, wav, path, pre / f"{oid}_words.json",
-                                            pre / f"{oid}_lips.json", man.get("target_lang"))
+            dwords, t, op, out_face_tracks = _words_and_lips(
+                mode, run_dir, wav, path, pre / f"{oid}_words.json",
+                pre / f"{oid}_lips.json", man.get("target_lang"))
+
             # Persist extracted words and lips locally for each dub output
             _write(run_dir / "words" / f"{oid}_words.json", dwords)
-            _write(run_dir / "lips" / f"{oid}_lips.json", {"t": t.tolist() if hasattr(t, "tolist") else list(t),
-                                                           "opening": op.tolist() if hasattr(op, "tolist") else list(op)})
+            _write(run_dir / "lips" / f"{oid}_lips.json", {
+                "t": t.tolist() if hasattr(t, "tolist") else list(t),
+                "opening": op.tolist() if hasattr(op, "tolist") else list(op)
+            })
+            if out_face_tracks:
+                _write(run_dir / "lips" / f"{oid}_face_tracks.json", out_face_tracks)
+
             d_w = dwords["words"]
             dub_det = lang.detect_for_words(d_w, dwords.get("language"))
             dub_ext = ginfo.extract_video(path, run_dir / "gemini" / f"{oid}.json", use_gemini)
@@ -110,13 +126,46 @@ def run(run_dir: Path, mode: str = "precomputed", use_judge: bool = False, use_g
             gem_summary = ginfo.summarize(src_ext, dub_ext)
             thr = timing.speaker_threshold(op)
             drifts = timing.word_drifts(d_w, t, op, thr)
-            pairs, missing, extra = align.align_words(src_w, d_w)
 
-            starts = [abs(d_w[j]["start"] - src_w[i]["start"]) * 1000 for i, j in pairs]
+            # Check multilingual status and approved target reference
+            ref_path = None
+            if o.get("target_reference_file"):
+                cand_ref = inputs / o["target_reference_file"]
+                if cand_ref.exists():
+                    ref_path = cand_ref
+            elif (inputs / f"{oid}_reference.json").exists():
+                ref_path = inputs / f"{oid}_reference.json"
+            elif (inputs / "target_reference.json").exists():
+                ref_path = inputs / "target_reference.json"
+
+            is_same_lang = (src_lang == dub_lang and src_lang is not None) or (mode == "precomputed" and not ref_path)
+
+            if is_same_lang:
+                pairs, missing, extra = align.align_words(src_w, d_w)
+                trans_fidelity = align.lexical_fidelity(src_w, pairs)
+                trans_method = "same-language lexical alignment"
+                wc_diff = round(100.0 * abs(len(d_w) - len(src_w)) / max(len(src_w), 1), 1)
+                missing_sent_count = align.missing_sentences(src_sent, src_w, pairs) if src_sent else None
+            elif ref_path:
+                ref_data = json.loads(ref_path.read_text(encoding="utf-8"))
+                ref_words = ref_data.get("words", [])
+                pairs, missing, extra = align.align_words(ref_words, d_w)
+                trans_fidelity = align.lexical_fidelity(ref_words, pairs)
+                trans_method = f"target-reference lexical alignment ({ref_path.name})"
+                wc_diff = round(100.0 * abs(len(d_w) - len(ref_words)) / max(len(ref_words), 1), 1)
+                missing_sent_count = align.missing_sentences(ref_data.get("sentences", []), ref_words, pairs) if ref_data.get("sentences") else 0
+            else:
+                pairs, missing, extra = [], [], []
+                trans_fidelity = None
+                trans_method = "NOT_MEASURED (cross-lingual without target reference)"
+                wc_diff = None
+                missing_sent_count = None
+
+            starts = [abs(d_w[j]["start"] - src_w[i]["start"]) * 1000 for i, j in pairs] if is_same_lang else []
             dub_speech = _speech_total(wav)
             values = {
-                "translation_fidelity": align.lexical_fidelity(src_w, pairs),
-                "word_count_diff": round(100.0 * abs(len(d_w) - len(src_w)) / max(len(src_w), 1), 1),
+                "translation_fidelity": trans_fidelity,
+                "word_count_diff": wc_diff,
                 "syllable_ratio": round(dub_speech / src_speech_s, 3) if src_speech_s else None,
                 "timing_drift_ms": round(float(np.median(starts)), 1) if starts else None,
                 "onset_drift_ms": timing.median_abs([d["onset_ms"] for d in drifts]),
@@ -124,20 +173,23 @@ def run(run_dir: Path, mode: str = "precomputed", use_judge: bool = False, use_g
                 "open_ratio_pct": timing.open_ratio_during_speech(t, op, thr, speech),
                 "false_movement_pct": timing.false_movement(t, op, thr, speech),
                 "word_pass_rate_pct": timing.word_pass_rate(drifts),
-                "missing_sentences": align.missing_sentences(src_sent, src_w, pairs) if src_sent else None,
+                "missing_sentences": missing_sent_count,
                 "hallucinations": None,
                 "emotion_match_pct": None,
                 "tone_match_pct": None,
                 "audio_quality": None,
             }
-            extras = {"duration_s": info["duration_s"],
-                      "duration_diff_pct": timing.duration_diff_pct(info["duration_s"], src_info["duration_s"]),
-                      "wpm_ratio": timing.speech_rate_ratio(len(d_w), info["duration_s"], len(src_w),
-                                                           src_info["duration_s"]),
-                      "av_offset_ms": timing.av_offset_ms(t, op, speech),
-                      "missing_words": missing[:50], "extra_words": extra[:50],
-                      "translation_method": "lexical-proxy" if mode == "precomputed" else "lexical-proxy (COMET not wired yet)",
-                      "speaker_threshold": None if np.isnan(thr) else round(float(thr), 4)}
+            extras = {
+                "duration_s": info["duration_s"],
+                "duration_diff_pct": timing.duration_diff_pct(info["duration_s"], src_info["duration_s"]),
+                "wpm_ratio": timing.speech_rate_ratio(len(d_w), info["duration_s"], len(src_w), src_info["duration_s"]),
+                "av_offset_ms": timing.av_offset_ms(t, op, speech),
+                "missing_words": missing[:50],
+                "extra_words": extra[:50],
+                "translation_method": trans_method,
+                "speaker_threshold": None if np.isnan(thr) else round(float(thr), 4),
+                "face_tracks_count": len(out_face_tracks)
+            }
 
             if use_judge and os.environ.get("GEMINI_API_KEY"):
                 judged = _judge_outputs(run_dir, path, oid, results["segments"], d_w, src_w, values, extras)
@@ -157,8 +209,10 @@ def run(run_dir: Path, mode: str = "precomputed", use_judge: bool = False, use_g
             values_by_out[oid] = values
             sc = scoring.score_output(values, th)
             log.info("%s done: overall=%s coverage=%s%%", oid, sc.get("overall"), sc.get("coverage_pct"))
-            results["outputs"][oid] = {"output_id": oid, "vendor": o["vendor"], "file": o["file"],
-                                       "values": values, "extras": extras, "score": sc}
+            results["outputs"][oid] = {
+                "output_id": oid, "vendor": o["vendor"], "file": o["file"],
+                "values": values, "extras": extras, "score": sc
+            }
 
         ranks = scoring.rank_outputs({k: v["score"]["overall"] for k, v in results["outputs"].items()})
         for k, r in ranks.items():
@@ -200,13 +254,26 @@ def run(run_dir: Path, mode: str = "precomputed", use_judge: bool = False, use_g
             "medium": sum(1 for d in defects if d["severity"] == "MEDIUM"),
             "low": sum(1 for d in defects if d["severity"] == "LOW"),
         }
-        results["overall_status"] = "FAIL" if results["defect_counts"]["critical"] > 0 else "PASS"
+
+        # Unified release decision policy
+        has_critical = results["defect_counts"]["critical"] > 0
+        has_high = results["defect_counts"]["high"] > 0
+        has_scenario_fail = any(s["status"] == "FAIL" for s in sc_results)
+        has_scenario_review = any(s["status"] == "REVIEW" for s in sc_results)
+        any_not_measured = any(s["status"] == "NOT_MEASURED" for s in sc_results)
+
+        if has_critical or has_high or has_scenario_fail:
+            results["overall_status"] = "FAIL"
+        elif has_scenario_review or any_not_measured or (results["defect_counts"]["medium"] > 0):
+            results["overall_status"] = "REVIEW"
+        else:
+            results["overall_status"] = "PASS"
 
         _write(run_dir / "results.json", results)
         _status(run_dir, "done")
         log.info("run finished")
         return results
-    except Exception as e:  # keep the error visible in the status file
+    except Exception as e:
         log.exception("run failed")
         _status(run_dir, "failed", error=str(e))
         raise

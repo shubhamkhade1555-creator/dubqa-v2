@@ -1,7 +1,8 @@
 """Lip and face tracking.
 
 Supports:
-  1. MediaPipe FaceLandmarker with configurable num_faces >= 1 (track_faces_mediapipe).
+  1. Multi-face tracking with bounding-box derivation, landmark mouth aperture,
+     gated centroid association, and track persistence (track_faces_mediapipe).
   2. Single-face backward-compatible mouth aperture (track_video_mediapipe).
   3. Precomputed JSON loading for tests and offline evaluation.
 """
@@ -24,7 +25,6 @@ def opening_from_landmarks(lm) -> float:
 
 
 def _ensure_task_model() -> Path:
-    # Check configured MODEL_CACHE_DIR first, then local config/models
     cache_dir = os.environ.get("MODEL_CACHE_DIR")
     if cache_dir:
         cand = Path(cache_dir) / "mediapipe" / "face_landmarker.task"
@@ -36,6 +36,65 @@ def _ensure_task_model() -> Path:
     if not p.exists() or p.stat().st_size < 1000:
         urllib.request.urlretrieve(MODEL_URL, str(p))
     return p
+
+
+class FaceTracker:
+    """Stable multi-face tracker with gated distance matching and track aging."""
+
+    def __init__(self, max_distance: float = 0.25, max_age_frames: int = 25):
+        self.max_distance = max_distance
+        self.max_age_frames = max_age_frames
+        self.tracks: dict[str, dict[str, Any]] = {}  # track_id -> {cx, cy, last_seen_frame, bbox}
+        self.next_id = 1
+
+    def update(self, detected_faces: list[dict], frame_idx: int) -> list[dict]:
+        """detected_faces: list of dicts with 'cx', 'cy', 'bbox', 'op', etc.
+        Returns list of matched face records for the current frame.
+        """
+        # Age out old tracks that haven't been matched
+        stale_ids = [
+            tid for tid, tdata in self.tracks.items()
+            if (frame_idx - tdata["last_seen_frame"]) > self.max_age_frames
+        ]
+        for tid in stale_ids:
+            del self.tracks[tid]
+
+        matched_records = []
+        used_track_ids = set()
+
+        for d_face in detected_faces:
+            best_track_id = None
+            min_dist = self.max_distance
+
+            for tid, tdata in self.tracks.items():
+                if tid in used_track_ids:
+                    continue
+                dist = float(np.hypot(d_face["cx"] - tdata["cx"], d_face["cy"] - tdata["cy"]))
+                if dist < min_dist:
+                    min_dist = dist
+                    best_track_id = tid
+
+            if best_track_id is None:
+                best_track_id = f"face_{self.next_id}"
+                self.next_id += 1
+
+            used_track_ids.add(best_track_id)
+            self.tracks[best_track_id] = {
+                "cx": d_face["cx"],
+                "cy": d_face["cy"],
+                "bbox": d_face["bbox"],
+                "last_seen_frame": frame_idx
+            }
+
+            matched_records.append({
+                "track_id": best_track_id,
+                "bbox": d_face["bbox"],
+                "mouth_opening": d_face["op"],
+                "confidence": d_face.get("confidence", "NOT_MEASURED"),
+                "visibility": d_face.get("visibility", "NOT_MEASURED")
+            })
+
+        return matched_records
 
 
 def track_faces_mediapipe(video: Path, num_faces: int = 3, fps_sample: float = 25.0) -> tuple[np.ndarray, np.ndarray, list[dict]]:
@@ -63,8 +122,7 @@ def track_faces_mediapipe(video: Path, num_faces: int = 3, fps_sample: float = 2
 
     ts, primary_vals, idx = [], [], 0
     face_tracks_records = []
-    prev_centroids = {}  # track_id -> (cx, cy)
-    next_track_id = 1
+    tracker = FaceTracker(max_distance=0.25, max_age_frames=int(fps_sample * 2))
 
     with vision.FaceLandmarker.create_from_options(options) as landmarker:
         while True:
@@ -80,47 +138,36 @@ def track_faces_mediapipe(video: Path, num_faces: int = 3, fps_sample: float = 2
 
                 current_frame_tracks = []
                 if res.face_landmarks:
-                    # Match detected faces to existing tracks by Euclidean centroid distance
                     detected_faces = []
                     for f_landmarks in res.face_landmarks:
                         lm = [(p.x, p.y) for p in f_landmarks]
-                        cx = float(np.mean([p[0] for p in lm]))
-                        cy = float(np.mean([p[1] for p in lm]))
+                        xs = [p[0] for p in lm]
+                        ys = [p[1] for p in lm]
+                        min_x, max_x = max(0.0, float(min(xs))), min(1.0, float(max(xs)))
+                        min_y, max_y = max(0.0, float(min(ys))), min(1.0, float(max(ys)))
+                        bbox = [round(min_x, 4), round(min_y, 4), round(max_x - min_x, 4), round(max_y - min_y, 4)]
+                        cx = float(np.mean(xs))
+                        cy = float(np.mean(ys))
                         op = opening_from_landmarks(lm)
-                        detected_faces.append({"lm": lm, "cx": cx, "cy": cy, "op": op})
-
-                    # Track association
-                    used_tracks = set()
-                    for d_face in detected_faces:
-                        best_track_id = None
-                        min_dist = 0.25  # threshold normalized dist
-                        for trk_id, trk_c in prev_centroids.items():
-                            if trk_id in used_tracks:
-                                continue
-                            dist = float(np.hypot(d_face["cx"] - trk_c[0], d_face["cy"] - trk_c[1]))
-                            if dist < min_dist:
-                                min_dist = dist
-                                best_track_id = trk_id
-
-                        if best_track_id is None:
-                            best_track_id = f"face_{next_track_id}"
-                            next_track_id += 1
-
-                        used_tracks.add(best_track_id)
-                        prev_centroids[best_track_id] = (d_face["cx"], d_face["cy"])
-
-                        record = {
-                            "t": round(t, 3),
-                            "track_id": best_track_id,
-                            "bbox": [d_face["cx"] - 0.1, d_face["cy"] - 0.1, 0.2, 0.2],
-                            "mouth_opening": round(d_face["op"], 4),
-                            "confidence": 0.95,
+                        detected_faces.append({
+                            "lm": lm, "cx": cx, "cy": cy, "bbox": bbox, "op": round(op, 4),
+                            "confidence": "NOT_MEASURED",
                             "visibility": "visible"
-                        }
-                        face_tracks_records.append(record)
-                        current_frame_tracks.append(record)
+                        })
 
-                    # Primary mouth opening: use face_1 or the most prominent face
+                    frame_assigned = tracker.update(detected_faces, frame_idx=idx)
+                    for rec in frame_assigned:
+                        item = {
+                            "t": round(t, 3),
+                            "track_id": rec["track_id"],
+                            "bbox": rec["bbox"],
+                            "mouth_opening": rec["mouth_opening"],
+                            "confidence": rec["confidence"],
+                            "visibility": rec["visibility"]
+                        }
+                        face_tracks_records.append(item)
+                        current_frame_tracks.append(item)
+
                     primary_face = next((f for f in current_frame_tracks if f["track_id"] == "face_1"), current_frame_tracks[0])
                     primary_vals.append(primary_face["mouth_opening"])
                 else:
