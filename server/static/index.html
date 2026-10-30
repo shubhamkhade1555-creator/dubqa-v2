@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DubQA v2 — AI Dubbing QA Evaluation Suite</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --surface2: #1c2330; --surface3: #222b3b;
+    --border: #2a3441; --border2: #3a4755;
+    --accent: #2563eb; --accent2: #1d4ed8; --accent-glow: rgba(37,99,235,0.18);
+    --green: #22c55e; --green-bg: rgba(34,197,94,0.10);
+    --yellow: #f59e0b; --yellow-bg: rgba(245,158,11,0.10);
+    --red: #ef4444; --red-bg: rgba(239,68,68,0.10);
+    --purple: #a855f7; --purple-bg: rgba(168,85,247,0.10);
+    --cyan: #06b6d4; --cyan-bg: rgba(6,182,212,0.10);
+    --text: #e6edf3; --text2: #8b949e; --text3: #6e7681;
+    --radius: 10px; --radius-lg: 16px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; line-height: 1.5; font-size: 14.5px;
+  }
+
+  /* Header */
+  .header {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 0 28px; display: flex; align-items: center; justify-content: space-between;
+    height: 60px; position: sticky; top: 0; z-index: 100;
+  }
+  .header-logo { display: flex; align-items: center; gap: 12px; }
+  .logo-mark {
+    width: 32px; height: 32px; background: linear-gradient(135deg, var(--accent), var(--cyan));
+    border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 14px; color: #fff;
+  }
+  .logo-text { font-size: 16px; font-weight: 700; letter-spacing: -0.3px; }
+  .logo-badge {
+    font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 20px;
+    background: var(--accent-glow); color: var(--accent); border: 1px solid var(--accent);
+  }
+  .header-right { display: flex; align-items: center; gap: 14px; font-size: 12px; }
+  .status-pill {
+    display: flex; align-items: center; gap: 6px; padding: 4px 10px;
+    border-radius: 20px; background: var(--green-bg); color: var(--green); border: 1px solid var(--green);
+    font-weight: 600;
+  }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  /* App Layout */
+  .app { display: grid; grid-template-columns: 240px 1fr; min-height: calc(100vh - 60px); }
+  @media (max-width: 860px) { .app { grid-template-columns: 1fr; } .sidebar { display: none; } }
+
+  /* Sidebar */
+  .sidebar {
+    background: var(--surface); border-right: 1px solid var(--border);
+    padding: 24px 16px; position: sticky; top: 60px; height: calc(100vh - 60px); overflow-y: auto;
+  }
+  .sidebar-label {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.8px; color: var(--text3); margin-bottom: 8px; padding-left: 8px;
+  }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+    border-radius: 8px; cursor: pointer; color: var(--text2); font-size: 13.5px;
+    transition: all 0.15s; margin-bottom: 4px; border: none; background: none; width: 100%; text-align: left;
+  }
+  .nav-item:hover { background: var(--surface2); color: var(--text); }
+  .nav-item.active { background: var(--accent-glow); color: var(--accent); font-weight: 600; }
+  .sidebar-box {
+    margin-top: 24px; padding: 12px; background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 8px; font-size: 11.5px; color: var(--text2); line-height: 1.6;
+  }
+  .sidebar-box strong { color: var(--text); }
+
+  /* Main Area */
+  .main { padding: 32px 40px; overflow-y: auto; max-width: 1200px; margin: 0 auto; width: 100%; }
+  .page-title { font-size: 24px; font-weight: 800; letter-spacing: -0.5px; margin-bottom: 4px; }
+  .page-sub { font-size: 13.5px; color: var(--text2); margin-bottom: 24px; }
+
+  /* Cards & Sections */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); padding: 22px; margin-bottom: 20px;
+  }
+  .card-title {
+    font-size: 15px; font-weight: 700; color: var(--text);
+    margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between;
+  }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  @media (max-width: 768px) { .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; } }
+
+  /* Form Elements */
+  label { display: block; font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 6px; }
+  input[type=text], select {
+    width: 100%; background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 12px; color: var(--text); font-size: 13px;
+    font-family: inherit; outline: none; transition: border-color 0.15s;
+  }
+  input[type=text]:focus, select:focus { border-color: var(--accent); }
+
+  /* Drag & Drop Upload Zone */
+  .upload-zone {
+    background: var(--surface2); border: 1.5px dashed var(--border2);
+    border-radius: var(--radius); padding: 28px 20px; text-align: center;
+    cursor: pointer; position: relative; transition: all 0.2s;
+  }
+  .upload-zone:hover, .upload-zone.drag-over {
+    border-color: var(--accent); background: var(--accent-glow);
+  }
+  .upload-zone.has-file {
+    border-style: solid; border-color: var(--green); background: var(--green-bg);
+  }
+  .upload-zone input[type=file] {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+  }
+  .upload-icon { font-size: 32px; margin-bottom: 8px; }
+  .upload-title { font-size: 14px; font-weight: 700; color: var(--text); margin-bottom: 3px; }
+  .upload-desc { font-size: 12px; color: var(--text2); }
+  .upload-filename { font-size: 12px; font-weight: 600; color: var(--green); margin-top: 8px; }
+
+  /* Test Case Selection Cards */
+  .tc-card {
+    background: var(--surface2); border: 1.5px solid var(--border);
+    border-radius: var(--radius); padding: 14px; cursor: pointer;
+    transition: all 0.2s; user-select: none; position: relative;
+  }
+  .tc-card:hover { border-color: var(--border2); }
+  .tc-card.selected { border-color: var(--accent); background: var(--accent-glow); }
+  .tc-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  .tc-name { font-size: 13px; font-weight: 700; }
+  .tc-badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 20px; background: var(--surface3); color: var(--cyan); }
+  .tc-desc { font-size: 11.5px; color: var(--text2); line-height: 1.4; }
+
+  /* Dubbed Items List */
+  .dub-item {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px; margin-bottom: 12px;
+  }
+  .dub-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .dub-num { font-size: 13px; font-weight: 700; color: var(--cyan); }
+  .btn-remove {
+    background: none; border: 1px solid var(--border); color: var(--text3);
+    border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer; transition: all 0.15s;
+  }
+  .btn-remove:hover { color: var(--red); border-color: var(--red); background: var(--red-bg); }
+
+  /* Buttons */
+  .btn-primary {
+    background: var(--accent); color: #fff; border: none; border-radius: 8px;
+    padding: 12px 24px; font-size: 14px; font-weight: 700; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 8px; transition: background 0.15s;
+  }
+  .btn-primary:hover { background: var(--accent2); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-secondary {
+    background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 18px; font-size: 13px; font-weight: 600;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* Execution Progress & Telemetry */
+  .progress-box {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px; margin-top: 16px;
+  }
+  .progress-bar-bg {
+    background: var(--bg); border-radius: 20px; height: 8px;
+    overflow: hidden; margin: 12px 0;
+  }
+  .progress-fill {
+    height: 100%; background: linear-gradient(90deg, var(--accent), var(--cyan));
+    width: 0%; transition: width 0.4s ease;
+  }
+  .step-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px; border-radius: 6px; font-size: 12.5px; margin-bottom: 4px;
+    background: var(--surface);
+  }
+  .step-done { color: var(--green); font-weight: 600; }
+  .step-active { color: var(--yellow); font-weight: 600; }
+
+  /* Live Terminal Log */
+  pre.log {
+    background: #080b10; color: #a5b4fc; padding: 14px; border-radius: 8px;
+    max-height: 280px; overflow-y: auto; font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; border: 1px solid var(--border);
+  }
+
+  /* Results Presentation & Iframe */
+  .report-frame {
+    width: 100%; height: 820px; border: 1px solid var(--border);
+    border-radius: var(--radius-lg); background: #ffffff;
+  }
+  .err { color: var(--red); font-size: 13px; margin-top: 8px; font-weight: 500; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<header class="header">
+  <div class="header-logo">
+    <div class="logo-mark">DQ</div>
+    <div>
+      <span class="logo-text">DubQA v2</span>
+      <span class="logo-badge">Gemini Powered</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="status-pill">
+      <div class="status-dot"></div>
+      <span>Engine Active</span>
+    </div>
+  </div>
+</header>
+
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-label">Navigation</div>
+    <button class="nav-item active" data-tab="eval">Evaluation Suite</button>
+    <button class="nav-item" data-tab="report">Last QC Report</button>
+    
+    <div class="sidebar-box">
+      <strong>Zero JSON Upload</strong><br>
+      Gemini extracts word timestamps, speech sentences, and detected language automatically. All intermediate files and matrices are saved in <code>runs/&lt;run_id&gt;/</code> on disk.
+    </div>
+  </aside>
+
+  <main class="main">
+    <section id="panelEval">
+      <h1 class="page-title">Automated Dubbing QA</h1>
+      <p class="page-sub">Upload the original source video and dubbed outputs. Gemini and MediaPipe automatically measure timing, sync, and emotion without requiring any precomputed JSON files.</p>
+
+      <form id="qaForm" autocomplete="off">
+        <!-- 1. Pipeline Test Configuration -->
+        <div class="card">
+          <div class="card-title">1. Test Suite Modules</div>
+          <div class="grid-4">
+            <div class="tc-card selected" data-tc="timing">
+              <div class="tc-header">
+                <span class="tc-name">TC1: Timing & Lip-Sync</span>
+                <span class="tc-badge">MediaPipe</span>
+              </div>
+              <p class="tc-desc">Onset & tail word drift, open ratio during speech, false mouth movements.</p>
+            </div>
+            <div class="tc-card selected" data-tc="lexical">
+              <div class="tc-header">
+                <span class="tc-name">TC2: Alignment</span>
+                <span class="tc-badge">Gemini</span>
+              </div>
+              <p class="tc-desc">Word-level timestamps, lexical translation match, speech duration ratio.</p>
+            </div>
+            <div class="tc-card selected" data-tc="emotion">
+              <div class="tc-header">
+                <span class="tc-name">TC3: Tone & Emotion</span>
+                <span class="tc-badge">LLM Judge</span>
+              </div>
+              <p class="tc-desc">Per-segment speaker emotion, tone fidelity, and semantic consistency.</p>
+            </div>
+            <div class="tc-card selected" data-tc="pairwise">
+              <div class="tc-header">
+                <span class="tc-name">TC4: Head-to-Head</span>
+                <span class="tc-badge">Matrix</span>
+              </div>
+              <p class="tc-desc">Pairwise vendor ranking matrix comparing every dubbed video against each other.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 2. Source Video Upload -->
+        <div class="card">
+          <div class="card-title">2. Source Video (Ground Truth)</div>
+          <div class="upload-zone" id="srcZone">
+            <input type="file" id="srcVideo" accept="video/*,.mp4,.mov,.webm,.mkv">
+            <div class="upload-icon">🎥</div>
+            <div class="upload-title">Drop or click to choose Source Video</div>
+            <div class="upload-desc">Select original master MP4/MKV file</div>
+            <div class="upload-filename" id="srcFilename"></div>
+          </div>
+          <div class="grid-2" style="margin-top:14px;">
+            <div>
+              <label for="runName">Run Name / Identifier</label>
+              <input type="text" id="runName" placeholder="batch_eval_01">
+            </div>
+            <div>
+              <label for="srcLang">Source Language</label>
+              <input type="text" id="srcLang" value="auto" placeholder="auto (Gemini detected)">
+            </div>
+          </div>
+        </div>
+
+        <!-- 3. Dubbed Videos Upload -->
+        <div class="card">
+          <div class="card-title">
+            <span>3. Dubbed Videos</span>
+            <button type="button" class="btn-secondary" id="btnAddDub">+ Add Dubbed Output</button>
+          </div>
+          <div id="dubsList"></div>
+        </div>
+
+        <div style="margin-top: 24px; display: flex; align-items: center; gap: 14px;">
+          <button type="submit" class="btn-primary" id="btnSubmit">
+            <span>⚡ Start Evaluation Run</span>
+          </button>
+          <span id="formError" class="err"></span>
+        </div>
+      </form>
+
+      <!-- Run Progress and Results Panel -->
+      <div id="runProgressCard" class="card hidden" style="margin-top: 24px;">
+        <div class="card-title">
+          <span id="runTitleDisplay">Evaluation in Progress</span>
+          <span id="runStatusBadge" class="status-pill">Processing</span>
+        </div>
+        
+        <div class="progress-box">
+          <div class="progress-bar-bg">
+            <div class="progress-fill" id="progressFill"></div>
+          </div>
+          <div id="stepContainer">
+            <div class="step-row" id="st1"><span>1. Audio Extraction & Media Probing</span><span class="step-active">Running...</span></div>
+            <div class="step-row" id="st2"><span>2. Gemini ASR & Language Identification</span><span>Pending</span></div>
+            <div class="step-row" id="st3"><span>3. MediaPipe Facial Landmark & Lip Sync</span><span>Pending</span></div>
+            <div class="step-row" id="st4"><span>4. Scoring, Pairwise Matrix & HTML Report</span><span>Pending</span></div>
+          </div>
+        </div>
+
+        <div style="margin-top: 18px;">
+          <label>Live Pipeline Execution Log</label>
+          <pre class="log" id="liveLog"></pre>
+        </div>
+
+        <div id="reportContainer" class="hidden" style="margin-top: 24px;">
+          <div class="card-title">
+            <span>Generated Synchronized HTML Report</span>
+            <a id="extReportLink" target="_blank" rel="noopener"><button class="btn-secondary">Open Fullscreen ↗</button></a>
+          </div>
+          <iframe id="reportFrame" class="report-frame" title="DubQA Report"></iframe>
+        </div>
+      </div>
+    </section>
+
+    <!-- Last QC Report Section -->
+    <section id="panelReport" class="hidden">
+      <div class="card-title">
+        <span>Verified Synthetic Quality Control Baseline</span>
+        <a href="/api/runs/QC_synthetic/report" target="_blank"><button class="btn-secondary">Open in New Tab ↗</button></a>
+      </div>
+      <iframe src="/api/runs/QC_synthetic/report" class="report-frame" title="QC Synthetic Baseline"></iframe>
+    </section>
+  </main>
+</div>
+
+<script>
+(() => {
+  let dubIndex = 0;
+  const platforms = ["HeyGen", "Sync.so", "FrameX", "Synthesia", "ElevenLabs", "Custom"];
+  
+  const $ = (id) => document.getElementById(id);
+
+  // Tabs
+  document.querySelectorAll(".nav-item").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".nav-item").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      const tab = btn.dataset.tab;
+      $("panelEval").classList.toggle("hidden", tab !== "eval");
+      $("panelReport").classList.toggle("hidden", tab !== "report");
+    });
+  });
+
+  // Source upload zone
+  $("srcVideo").addEventListener("change", (e) => {
+    const f = e.target.files[0];
+    if (f) {
+      $("srcZone").classList.add("has-file");
+      $("srcFilename").textContent = `Selected: ${f.name} (${(f.size / (1024*1024)).toFixed(1)} MB)`;
+    }
+  });
+
+  // Test Case Card Toggles
+  document.querySelectorAll(".tc-card").forEach(c => {
+    c.addEventListener("click", () => c.classList.toggle("selected"));
+  });
+
+  // Add Dubbed Row
+  function addDubRow() {
+    dubIndex++;
+    const idx = dubIndex;
+    const row = document.createElement("div");
+    row.className = "dub-item";
+    row.id = `dubRow_${idx}`;
+    const opts = platforms.map(p => `<option value="${p}">${p}</option>`).join("");
+    row.innerHTML = `
+      <div class="dub-head">
+        <span class="dub-num">Dubbed Output #${idx}</span>
+        <button type="button" class="btn-remove" onclick="document.getElementById('dubRow_${idx}').remove()">Remove</button>
+      </div>
+      <div class="grid-2">
+        <div class="upload-zone" style="padding:16px;">
+          <input type="file" data-dub-video accept="video/*,.mp4,.mov,.webm,.mkv">
+          <div style="font-size:20px;margin-bottom:4px;">🎬</div>
+          <div class="upload-title" style="font-size:12.5px;">Choose Dubbed Video</div>
+          <div class="upload-filename" data-dub-name></div>
+        </div>
+        <div>
+          <label>Platform / Vendor</label>
+          <select data-dub-platform style="margin-bottom:10px;">${opts}</select>
+          <label>Target Language</label>
+          <input type="text" data-dub-lang value="auto" placeholder="auto (Gemini detected)">
+        </div>
+      </div>
+    `;
+
+    const fileInput = row.querySelector("[data-dub-video]");
+    fileInput.addEventListener("change", (e) => {
+      const f = e.target.files[0];
+      if (f) {
+        row.querySelector("[data-dub-name]").textContent = `${f.name} (${(f.size / (1024*1024)).toFixed(1)} MB)`;
+        fileInput.parentElement.classList.add("has-file");
+        // Auto-detect platform name from filename
+        const low = f.name.toLowerCase();
+        for (const p of platforms) {
+          if (low.includes(p.toLowerCase())) {
+            row.querySelector("[data-dub-platform]").value = p;
+            break;
+          }
+        }
+      }
+    });
+
+    $("dubsList").appendChild(row);
+  }
+
+  $("btnAddDub").addEventListener("click", addDubRow);
+  // Add first row by default
+  addDubRow();
+
+  // Form Submission
+  $("qaForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    $("formError").textContent = "";
+
+    const srcFile = $("srcVideo").files[0];
+    if (!srcFile) {
+      $("formError").textContent = "Please select a source video file.";
+      return;
+    }
+
+    const dubRows = [...document.querySelectorAll(".dub-item")];
+    if (!dubRows.length) {
+      $("formError").textContent = "Add at least one dubbed video.";
+      return;
+    }
+
+    const files = [srcFile];
+    const outputs = [];
+    for (const [i, row] of dubRows.entries()) {
+      const vid = row.querySelector("[data-dub-video]").files[0];
+      const platform = row.querySelector("[data-dub-platform]").value;
+      if (!vid) {
+        $("formError").textContent = `Please select a video file for Dubbed Output #${i + 1}.`;
+        return;
+      }
+      files.push(vid);
+      outputs.push({
+        output_id: `${platform.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${i + 1}`,
+        vendor: platform,
+        file: vid.name
+      });
+    }
+
+    const runId = ($("runName").value.trim() || "run") + "_" + Date.now().toString().slice(-6);
+    const manifest = {
+      run_id: runId,
+      source: { file: srcFile.name, lang: $("srcLang").value.trim() || "auto" },
+      outputs: outputs,
+      target_lang: "auto"
+    };
+
+    const fd = new FormData();
+    fd.append("manifest", new Blob([JSON.stringify(manifest)], { type: "application/json" }), "manifest.json");
+    for (const f of files) {
+      fd.append("files", f, f.name);
+    }
+    fd.append("mode", "full");
+    fd.append("use_judge", "true");
+    fd.append("use_gemini", "true");
+
+    $("btnSubmit").disabled = true;
+    $("runProgressCard").classList.remove("hidden");
+    $("runTitleDisplay").textContent = `Evaluation Run: ${runId}`;
+    $("progressFill").style.width = "25%";
+
+    try {
+      const res = await fetch("/api/runs", { method: "POST", body: fd });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || "Upload failed");
+      }
+      pollProgress(runId);
+    } catch (err) {
+      $("formError").textContent = err.message;
+      $("btnSubmit").disabled = false;
+    }
+  });
+
+  // Polling for progress and report
+  let logOffset = 0;
+  function pollProgress(runId) {
+    const timer = setInterval(async () => {
+      try {
+        const metaRes = await fetch(`/api/runs/${runId}`);
+        if (!metaRes.ok) return;
+        const meta = await metaRes.json();
+
+        // Read logs
+        const logRes = await fetch(`/api/runs/${runId}/log?offset=${logOffset}`);
+        if (logRes.ok) {
+          const logData = await logRes.json();
+          if (logData.text) {
+            $("liveLog").textContent += logData.text;
+            $("liveLog").scrollTop = $("liveLog").scrollHeight;
+            logOffset = logData.next_offset;
+          }
+        }
+
+        if (meta.status === "running") {
+          $("progressFill").style.width = "65%";
+          $("st2").children[1].className = "step-active";
+          $("st2").children[1].textContent = "Running...";
+        } else if (meta.status === "done") {
+          clearInterval(timer);
+          $("progressFill").style.width = "100%";
+          $("runStatusBadge").textContent = "Completed & Saved";
+          $("runStatusBadge").style.borderColor = "var(--green)";
+          $("btnSubmit").disabled = false;
+
+          document.querySelectorAll("#stepContainer span:last-child").forEach(s => {
+            s.className = "step-done";
+            s.textContent = "Done ✓";
+          });
+
+          // Show generated report
+          const repUrl = `/api/runs/${runId}/report`;
+          $("reportContainer").classList.remove("hidden");
+          $("reportFrame").src = repUrl;
+          $("extReportLink").href = repUrl;
+        } else if (meta.status === "failed") {
+          clearInterval(timer);
+          $("runStatusBadge").textContent = "Failed";
+          $("runStatusBadge").style.borderColor = "var(--red)";
+          $("runStatusBadge").style.color = "var(--red)";
+          $("btnSubmit").disabled = false;
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }, 2000);
+  }
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,4 @@
+# Heavy models for full video processing.
+mediapipe>=0.10
+opencv-python-headless>=4.9
+google-genai>=0.3

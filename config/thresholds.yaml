@@ -1,0 +1,38 @@
+# Single threshold set used by the whole pipeline. Version it when changed.
+version: "2.0"
+metrics:
+  translation_fidelity:   {label: "Translation fidelity (%)",     direction: min, good: 85,  check: 75,  group: meaning}
+  word_count_diff:        {label: "Word-count difference (%)",    direction: max, good: 10,  check: 20,  group: words}
+  syllable_ratio:         {label: "Speech-length ratio",          direction: band, low: 0.85, high: 1.15, check_low: 0.75, check_high: 1.25, group: words}
+  timing_drift_ms:        {label: "Timing drift (ms)",            direction: max, good: 200, check: 400, group: words}
+  onset_drift_ms:         {label: "Mouth-onset drift (ms)",       direction: max_abs, good: 80, check: 150, group: lipsync}
+  tail_drift_ms:          {label: "Mouth-tail drift (ms)",        direction: max_abs, good: 80, check: 150, group: lipsync}
+  open_ratio_pct:         {label: "Mouth open during speech (%)", direction: min, good: 80, check: 65, group: lipsync}
+  false_movement_pct:     {label: "False mouth movement (%)",     direction: max, good: 5,   check: 10,  group: lipsync}
+  word_pass_rate_pct:     {label: "Word lip-sync pass rate (%)",  direction: min, good: 85,  check: 70,  group: lipsync}
+  emotion_match_pct:      {label: "Emotion match (%)",            direction: min, good: 75,  check: 60,  group: voice}
+  tone_match_pct:         {label: "Tone match (%)",               direction: min, good: 70,  check: 55,  group: voice}
+  audio_quality:          {label: "Audio clarity (0-10)",         direction: min, good: 7.0, check: 5.5, group: voice}
+  missing_sentences:      {label: "Missing sentences",            direction: max, good: 0,   check: 1,   group: meaning}
+  hallucinations:         {label: "Hallucinations",               direction: max, good: 0,   check: 0,   group: meaning}
+# Weights for the overall score. Missing metrics are excluded and reported as coverage.
+group_weights: {meaning: 30, words: 20, lipsync: 20, voice: 15, audio: 15}
+release_gate:
+  min_overall: 85
+  max_missing_coverage_pct: 30
+# Tie tolerances for pairwise comparison (same units as the metric).
+tie_tolerance:
+  translation_fidelity: 2
+  word_count_diff: 2
+  syllable_ratio: 0.05
+  timing_drift_ms: 20
+  onset_drift_ms: 20
+  tail_drift_ms: 20
+  open_ratio_pct: 2
+  false_movement_pct: 2
+  word_pass_rate_pct: 2
+  emotion_match_pct: 2
+  tone_match_pct: 2
+  audio_quality: 0.5
+  missing_sentences: 0
+  hallucinations: 0

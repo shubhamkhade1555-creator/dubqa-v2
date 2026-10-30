@@ -1,0 +1,17 @@
+flowchart LR
+    U[Browser<br/>index.html] -->|upload videos + platform + languages| API[FastAPI<br/>server/app.py]
+    API -->|manifest + files| RUN[(runs/run_id/<br/>inputs, precomputed, gemini, measure, report)]
+    API -->|background thread| P[Pipeline<br/>core/pipeline.py]
+    P --> M1[Local measurement<br/>ffmpeg, VAD, MediaPipe lips,<br/>Whisper words, alignment]
+    P --> LANG[Language detection<br/>core/lang.py<br/>Whisper / JSON / Gemini / script]
+    P --> G[Gemini extraction<br/>core/info.py + judge_gemini.py<br/>language, speakers, emotion,<br/>segments, transcripts]
+    G --> C[Code counts<br/>core/counts.py + segment matching<br/>words, syllables, segments, speakers]
+    M1 --> S[Scoring and ranking<br/>core/scoring.py, pairwise.py<br/>thresholds.yaml]
+    LANG --> S
+    C --> S
+    S --> RES[(results.json, run_meta.json, run.log)]
+    RES --> R[Report builder<br/>report/build_html.py<br/>Jinja2 template]
+    R --> HTML[report/index.html]
+    U -->|poll status + log| API
+    API -->|log offset, status| U
+    HTML -->|embedded in page| U

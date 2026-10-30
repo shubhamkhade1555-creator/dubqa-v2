@@ -1,0 +1,6 @@
+# Vendor names are taken from the manifest; this file only maps display colours and order.
+vendors:
+  HeyGen:    {order: 1}
+  Synthesia: {order: 2}
+  Sync.so:   {order: 3}
+  FrameX:    {order: 4}

@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DubQA v2 · {{ r['run_id'] }}</title>
+<style>
+body{font-family:Inter,system-ui,sans-serif;margin:0;background:#0b0f19;color:#f1f5f9}
+header{padding:24px;border-bottom:1px solid #1f2937}
+h1{margin:0 0 6px;font-size:22px} h2{font-size:17px;margin:28px 24px 8px}
+.meta{color:#94a3b8;font-size:13px}
+.wrap{padding:0 24px 60px}
+table{border-collapse:collapse;width:100%;font-size:13px;background:#111827;margin-bottom:8px}
+th,td{border-bottom:1px solid #1f2937;padding:7px 9px;text-align:left;vertical-align:top}
+th{background:#1f2937;color:#94a3b8;font-size:11px;text-transform:uppercase}
+.Good{color:#10b981;font-weight:700}.Check{color:#f59e0b;font-weight:700}.Fix{color:#ef4444;font-weight:700}
+.na{color:#64748b}
+.players{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+.card{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:10px}
+video{width:100%;background:#000;border-radius:6px}
+.controls button{background:#1f2937;color:#f1f5f9;border:1px solid #374151;border-radius:6px;padding:5px 10px;margin-right:6px;cursor:pointer}
+canvas{width:100%;height:70px;background:#0f172a;border-radius:6px;margin-top:6px}
+.note{color:#94a3b8;font-size:12px}
+</style></head><body>
+<header>
+<h1>AI Dubbing QA · {{ r['run_id'] }}</h1>
+<div class="meta">Mode: {{ r['mode'] }} · Thresholds {{ r['thresholds_version'] }} · Generated {{ r['generated'] }} · Source {{ r['source']['file'] }} ({{ r['source']['duration_s'] }} s)</div>
+</header>
+<div class="wrap">
+
+<h2>1. Overall results</h2>
+<table><tr><th>Output</th><th>Vendor</th><th>Overall</th><th>Rank</th><th>Coverage</th><th>Release</th><th>Metrics failing</th></tr>
+{% for o in outputs %}
+<tr><td>{{ o['output_id'] }}</td><td>{{ o['vendor'] }}</td>
+<td><b>{{ o['score']['overall'] if o['score']['overall'] is not none else 'Not measured' }}</b></td>
+<td>{{ o['overall_rank'] }}</td><td>{{ o['score']['coverage_pct'] }}%</td>
+<td class="{{ 'Good' if o['score']['release'] == 'Approved' else 'Check' }}">{{ o['score']['release'] }}</td>
+<td>{{ o['score']['fix_metrics'] | join(', ') or '—' }}</td></tr>
+{% endfor %}
+</table>
+
+<h2>2. Scorecard</h2>
+<table><tr><th>Metric</th>{% for o in outputs %}<th>{{ o['vendor'] }}</th>{% endfor %}</tr>
+{% for key, cfg in metrics.items() %}
+<tr><td>{{ cfg['label'] }}</td>
+{% for o in outputs %}
+{% set v = o['values'][key] %}{% set lab = o['score']['labels'][key] %}
+<td>{% if v is none %}<span class="na">Not measured</span>{% else %}{{ v }} <span class="{{ lab }}">{{ lab }}</span>{% endif %}</td>
+{% endfor %}</tr>
+{% endfor %}
+</table>
+<p class="note">Labels come from config/thresholds.yaml. "Not measured" means no valid data. It is never counted as a pass.</p>
+
+<h2>3. Pairwise comparison (every dub against every other dub)</h2>
+<table><tr><th>Pair</th><th>Wins A</th><th>Wins B</th></tr>
+{% for name, p in r['pairs'].items() %}
+<tr><td>{{ name }}</td><td>{{ p['wins_a'] }}</td><td>{{ p['wins_b'] }}</td></tr>
+{% endfor %}
+</table>
+
+<h2>4. Synchronised players</h2>
+<div class="controls"><button onclick="seekAll(0)">Start</button><button onclick="playAll()">Play all</button><button onclick="pauseAll()">Pause</button></div>
+<div class="players">
+<div class="card"><b>Source</b><video id="v_src" controls preload="metadata" src="{{ src_media }}"></video></div>
+{% for o in outputs %}
+<div class="card"><b>{{ o['vendor'] }}</b> <span class="note">{{ o['output_id'] }}</span>
+<video id="v_{{ o['output_id'] }}" controls preload="metadata" src="media/{{ o['output_id'] }}.mp4"></video>
+<canvas id="c_{{ o['output_id'] }}"></canvas>
+</div>
+{% endfor %}
+</div>
+
+<h2>5. Segments (source sentences, real timestamps)</h2>
+<table><tr><th>#</th><th>Time</th><th>Source text</th></tr>
+{% for s in r['segments'] %}<tr><td>{{ s['seg'] }}</td><td><a href="#" onclick="seekAll({{ s['start'] }});return false;">{{ '%.2f' | format(s['start']) }}–{{ '%.2f' | format(s['end']) }} s</a></td><td>{{ s['text'] }}</td></tr>{% endfor %}
+</table>
+
+<h2>6. Language, segments and counts</h2>
+{% set S0 = r['info'][outputs[0]['output_id']]['summary'] %}
+<p class="note">Languages are detected automatically (Whisper or the words file, then Gemini, then the Unicode script of the transcript). Gemini extracts labels and transcripts. Counts are computed by code. Gemini's segment times are approximate and are never used for timing or lip-sync numbers.</p>
+<table>
+<tr><th>Item</th><th>Source</th>{% for o in outputs %}<th>{{ o['vendor'] }}</th>{% endfor %}</tr>
+<tr><td>Language (declared, then resolved)</td><td>{{ r['languages']['source']['declared'] or '-' }} &rarr; {{ r['languages']['source']['resolved'] or 'undetermined' }}</td>
+{% for o in outputs %}{% set L = r['info'][o['output_id']]['language'] %}<td>{{ L['declared'] or '-' }} &rarr; {{ L['resolved'] or 'undetermined' }}{% for n in L['notes'] %}<br><span class="note">{{ n }}</span>{% endfor %}</td>{% endfor %}</tr>
+<tr><td>Detection method</td><td>{{ r['languages']['source']['detection']['method'] }}{% if r['languages']['source']['detection']['script'] %} ({{ r['languages']['source']['detection']['script'] }}){% endif %}</td>
+{% for o in outputs %}{% set D = r['info'][o['output_id']]['language']['detection'] %}<td>{{ D['method'] }}{% if D['script'] %} ({{ D['script'] }}){% endif %}</td>{% endfor %}</tr>
+<tr><td>Gemini extraction</td><td>{{ r['gemini_source']['status'] }}{% if r['gemini_source']['reason'] %}<br><span class="note">{{ r['gemini_source']['reason'] }}</span>{% endif %}</td>
+{% for o in outputs %}{% set G = r['info'][o['output_id']]['gemini'] %}<td>{{ G['status'] }}{% if G['reason'] %}<br><span class="note">{{ G['reason'] }}</span>{% endif %}</td>{% endfor %}</tr>
+{% if S0['status'] != 'ok' %}
+<tr><td>Counts</td><td colspan="{{ outputs|length + 1 }}" class="na">Not measured: {{ S0['reason'] }}</td></tr>
+{% else %}
+<tr><td>Speakers (source, dub)</td><td>{{ S0['speakers_src'] }}</td>
+{% for o in outputs %}{% set S = r['info'][o['output_id']]['summary'] %}<td>{% if S['status'] == 'ok' %}{{ S['speakers_dub'] }}{% else %}<span class="na">not measured</span>{% endif %}</td>{% endfor %}</tr>
+<tr><td>Segments (source, dub, difference)</td><td>{{ S0['segments_src'] }}</td>
+{% for o in outputs %}{% set S = r['info'][o['output_id']]['summary'] %}<td>{% if S['status'] == 'ok' %}{{ S['segments_dub'] }} ({{ S['segment_count_diff'] }}){% else %}<span class="na">not measured</span>{% endif %}</td>{% endfor %}</tr>
+<tr><td>Dub segments with no source match</td><td>-</td>
+{% for o in outputs %}{% set S = r['info'][o['output_id']]['summary'] %}<td>{% if S['status'] == 'ok' %}{{ S['unmatched_dub_segments'] }}{% else %}<span class="na">not measured</span>{% endif %}</td>{% endfor %}</tr>
+<tr><td>Words (source, dub, % difference)</td><td>{{ S0['words_src'] }}</td>
+{% for o in outputs %}{% set S = r['info'][o['output_id']]['summary'] %}<td>{% if S['status'] == 'ok' %}{{ S['words_dub'] }} ({{ S['word_diff_pct'] }}%){% else %}<span class="na">not measured</span>{% endif %}</td>{% endfor %}</tr>
+<tr><td>Syllables, heuristic (source, dub, % difference)</td><td>{{ S0['syll_src'] }}</td>
+{% for o in outputs %}{% set S = r['info'][o['output_id']]['summary'] %}<td>{% if S['status'] == 'ok' %}{{ S['syll_dub'] }} ({{ S['syll_diff_pct'] }}%){% else %}<span class="na">not measured</span>{% endif %}</td>{% endfor %}</tr>
+<tr><td>Emotion agreement, matched segments</td><td>-</td>
+{% for o in outputs %}{% set S = r['info'][o['output_id']]['summary'] %}<td>{% if S['status'] == 'ok' and S['emotion_match_pct'] is not none %}{{ S['emotion_match_pct'] }}%{% else %}<span class="na">not measured</span>{% endif %}</td>{% endfor %}</tr>
+{% endif %}
+</table>
+{% for o in outputs %}{% set S = r['info'][o['output_id']]['summary'] %}{% if S['status'] == 'ok' %}
+<p class="note"><b>Segment detail: {{ o['vendor'] }}</b> ({{ o['output_id'] }})</p>
+<table><tr><th>Seg</th><th>Source time</th><th>Dub time</th><th>Source text</th><th>Dub text</th><th>Words diff</th><th>Syllables diff</th><th>Emotion (src to dub)</th></tr>
+{% for row in S['rows'] %}<tr><td>{{ row['seg'] }}</td><td>{{ row['src_time'] }}</td><td>{{ row['dub_time'] }}</td><td>{{ row['src_text'] }}</td><td>{{ row['dub_text'] }}</td>
+<td>{% if row['word_diff_pct'] is not none %}{{ row['word_diff_pct'] }}%{% else %}<span class="na">-</span>{% endif %}</td>
+<td>{% if row['syll_diff_pct'] is not none %}{{ row['syll_diff_pct'] }}%{% else %}<span class="na">-</span>{% endif %}</td>
+<td>{{ row['src_emotion'] or '-' }} to {{ row['dub_emotion'] or '-' }}</td></tr>{% endfor %}
+</table>
+{% endif %}{% endfor %}
+
+<h2>7. Required data checklist</h2>
+<table><tr><th>Item</th><th>Status</th><th>Detail</th></tr>
+{% for c in r['required_data'] %}<tr><td>{{ c['item'] }}</td><td class="{{ 'Good' if c['status'] == 'present' else 'Fix' }}">{{ c['status'] }}</td><td>{{ c['detail'] }}</td></tr>{% endfor %}
+</table>
+
+<h2>8. Data notes</h2>
+<ul class="note">
+<li>Translation fidelity is a lexical proxy (matched words ÷ source words) until COMET is wired in.</li>
+<li>Emotion, tone and hallucination values appear only when the Gemini judgment step ran.</li>
+<li>Lip timing is only as good as the lip tracker. Check a few segments by eye.</li>
+</ul>
+</div>
+<script>
+const LIPS = {{ lips_json | safe }};
+const OUT_IDS = {{ outputs | map(attribute='output_id') | list | tojson }};
+function vids(){return Array.from(document.querySelectorAll('video'));}
+function seekAll(t){vids().forEach(v=>{v.currentTime=t;});}
+function playAll(){vids().forEach(v=>v.play().catch(()=>{}));}
+function pauseAll(){vids().forEach(v=>v.pause());}
+function drawLips(oid){
+  const c=document.getElementById('c_'+oid); if(!c) return;
+  const data=LIPS[oid]||[]; const ctx=c.getContext('2d');
+  c.width=c.clientWidth*2; c.height=c.clientHeight*2; ctx.clearRect(0,0,c.width,c.height);
+  if(!data.length) return; const mx=Math.max(...data,0.001);
+  ctx.strokeStyle='#38bdf8'; ctx.beginPath();
+  data.forEach((v,i)=>{const x=i/data.length*c.width, y=c.height-(v/mx)*c.height*0.9-4; i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+  ctx.stroke();
+}
+OUT_IDS.forEach(drawLips);
+</script>
+</body></html>

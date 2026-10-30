@@ -1,0 +1,12 @@
+services:
+  api:
+    build:
+      context: .
+      args:
+        WITH_ML: "${WITH_ML:-0}"
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./runs:/app/runs
+    restart: unless-stopped
