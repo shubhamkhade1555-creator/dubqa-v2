@@ -1,0 +1,38 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.integration.example
+      args:
+        WITH_ML: "${WITH_ML:-1}"
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../.env
+    environment:
+      RUNS_DIR: /app/runs
+      MODEL_CACHE_DIR: /models
+      REPORT_PUBLISH_MODE: "${REPORT_PUBLISH_MODE:-private}"
+    volumes:
+      - ../runs:/app/runs
+      - ../model_cache:/models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  model-bootstrap:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.integration.example
+      args:
+        WITH_ML: "1"
+    profiles: ["models"]
+    environment:
+      MODEL_CACHE_DIR: /models
+    volumes:
+      - ../model_cache:/models
+    entrypoint: ["python", "scripts/download_models.py"]
+    command: ["--face-landmarker", "--whisper-model", "small"]

@@ -1,0 +1,1444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DubQA v2 — Complete Architectural Handbook & Codebase</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.6; margin: 0; padding: 30px; }
+  h1 { color: #58a6ff; border-bottom: 2px solid #30363d; padding-bottom: 10px; }
+  h2 { color: #7ee787; margin-top: 30px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+  h3 { color: #ffa657; margin-top: 20px; }
+  .badge { display: inline-block; background: #1f6feb22; color: #58a6ff; border: 1px solid #1f6feb; border-radius: 20px; padding: 2px 10px; font-size: 12px; margin-bottom: 10px; }
+  .desc { color: #8b949e; font-size: 14px; margin-bottom: 10px; }
+  pre { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; overflow-x: auto; font-family: 'SF Mono', Consolas, Monaco, monospace; font-size: 13px; color: #e6edf3; }
+  .arch-box { background: #161b22; border: 1px solid #388bfd; border-radius: 10px; padding: 20px; margin-bottom: 30px; }
+  ol { padding-left: 20px; }
+  li { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<h1>DubQA v2 — Complete Architecture & Codebase Handbook</h1>
+<div class="arch-box">
+  <h2>System Architecture & End-to-End Pipeline</h2>
+  <p>DubQA v2 is an automated audio-visual Quality Assurance system for evaluating dubbed videos against ground-truth source videos.</p>
+  <h3>End-to-End Data Flow</h3>
+  <ol>
+    <li><strong>Input Ingestion:</strong> Source video & 1+ Dubbed video files uploaded via Web UI or REST API.</li>
+    <li><strong>Audio Processing:</strong> FFmpeg demuxes 16kHz mono WAV audio tracks; Energy VAD detects speech intervals.</li>
+    <li><strong>Gemini ASR Engine:</strong> Direct audio upload to Google Gemini 2.5 Flash API with structured JSON output schema for word timestamps and language ID.</li>
+    <li><strong>MediaPipe Vision Engine:</strong> Tasks Vision FaceLandmarker measures upper and lower inner lip distance normalized by mouth width over sampled video frames.</li>
+    <li><strong>Drift & Alignment Math:</strong> Dynamic Time Warping aligns words; onset/tail drifts and speech open ratios during silence are measured.</li>
+    <li><strong>Gemini LLM Judge (Optional):</strong> Evaluates emotion preservation and tone match per dialogue segment.</li>
+    <li><strong>Scoring & Pairwise Matrix:</strong> Weighted scores, Good/Bad gates, and complete head-to-head tournament rankings are computed.</li>
+    <li><strong>Artifact Generation:</strong> Local JSON matrices and a standalone interactive HTML report with synchronized video players are generated.</li>
+  </ol>
+</div>
+<h2>Core Source Code Files</h2>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/asr.py — Gemini Audio Speech Recognition</h3>
+  <div class="desc">Direct audio upload to Gemini 2.5 Flash API with structured JSON output schema extracting word timestamps (start, end) and detected language. Replaces Whisper.</div>
+  <pre><code>&quot;&quot;&quot;Word-level transcription and language detection with Gemini API.
+
+Replaces faster-whisper with Google Gemini audio understanding.
+Falls back cleanly to precomputed JSON files or reports errors if GEMINI_API_KEY is unset.
+&quot;&quot;&quot;
+import json
+import os
+import time
+from pathlib import Path
+from pydantic import BaseModel, Field
+
+
+class WordTimestamp(BaseModel):
+    word: str
+    start: float = Field(description=&quot;Start time in seconds with millisecond precision, e.g. 0.45&quot;)
+    end: float = Field(description=&quot;End time in seconds with millisecond precision, e.g. 0.82&quot;)
+
+
+class SentenceSegment(BaseModel):
+    text: str
+    start: float
+    end: float
+
+
+class AudioTranscriptionSchema(BaseModel):
+    language: str = Field(description=&quot;Detected ISO 639-1 language code, e.g. &#x27;en&#x27;, &#x27;es&#x27;, &#x27;hi&#x27;&quot;)
+    language_prob: float = Field(description=&quot;Confidence probability between 0.0 and 1.0&quot;, default=1.0)
+    words: list[WordTimestamp]
+    sentences: list[SentenceSegment]
+
+
+def transcribe_words(wav: Path, lang: str | None = None) -&gt; dict:
+    &quot;&quot;&quot;Transcribes audio using Gemini and extracts word-level timestamps and detected language.&quot;&quot;&quot;
+    api_key = os.environ.get(&quot;GEMINI_API_KEY&quot;)
+    if not api_key:
+        raise RuntimeError(&quot;GEMINI_API_KEY is not set in environment or .env file.&quot;)
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as e:
+        raise RuntimeError(&quot;google-genai library is not installed. Run: pip install google-genai&quot;) from e
+
+    client = genai.Client(api_key=api_key)
+    model_name = os.environ.get(&quot;GEMINI_MODEL&quot;, &quot;gemini-2.5-flash&quot;)
+
+    # 1. Upload audio to Gemini File API
+    audio_file = client.files.upload(file=str(wav))
+    try:
+        # Wait for file to become active
+        for _ in range(30):
+            status = client.files.get(name=audio_file.name).state.name
+            if status == &quot;ACTIVE&quot;:
+                break
+            if status == &quot;FAILED&quot;:
+                raise RuntimeError(f&quot;Audio file processing failed on Gemini server: {audio_file.name}&quot;)
+            time.sleep(1)
+
+        # 2. Build structured transcription prompt
+        prompt = (
+            &quot;You are an expert audio transcription system. Listen to the attached audio carefully.\n&quot;
+            &quot;Generate an exact, highly accurate verbatim transcript with precise word-level start and end timestamps (in seconds).\n&quot;
+            &quot;Ensure every spoken word has its corresponding start and end offset.\n&quot;
+        )
+        if lang:
+            prompt += f&quot;Expected spoken language: {lang}.\n&quot;
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[audio_file, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type=&quot;application/json&quot;,
+                response_schema=AudioTranscriptionSchema,
+                temperature=0.0,
+            ),
+        )
+
+        data = json.loads(response.text)
+
+        # 3. Format dictionary to conform with DubQA pipeline requirements
+        words = [
+            {&quot;word&quot;: w[&quot;word&quot;].strip(), &quot;start&quot;: round(float(w[&quot;start&quot;]), 3), &quot;end&quot;: round(float(w[&quot;end&quot;]), 3)}
+            for w in data.get(&quot;words&quot;, [])
+        ]
+        sentences = [
+            {&quot;text&quot;: s[&quot;text&quot;].strip(), &quot;start&quot;: round(float(s[&quot;start&quot;]), 3), &quot;end&quot;: round(float(s[&quot;end&quot;]), 3)}
+            for s in data.get(&quot;sentences&quot;, [])
+        ]
+
+        return {
+            &quot;words&quot;: words,
+            &quot;sentences&quot;: sentences,
+            &quot;language&quot;: data.get(&quot;language&quot;, lang or &quot;en&quot;),
+            &quot;language_prob&quot;: round(float(data.get(&quot;language_prob&quot;, 1.0)), 3),
+        }
+
+    finally:
+        # Clean up uploaded audio file from Gemini remote storage
+        try:
+            client.files.delete(name=audio_file.name)
+        except Exception:
+            pass
+
+
+def load_words(path: Path) -&gt; dict:
+    &quot;&quot;&quot;Loads precomputed transcription JSON file (used for QC mode).&quot;&quot;&quot;
+    return json.loads(Path(path).read_text(encoding=&quot;utf-8&quot;))
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/lips.py — MediaPipe Lip Movement Tracking</h3>
+  <div class="desc">Uses Google MediaPipe Tasks Vision FaceLandmarker on sampled video frames to calculate vertical inner lip opening normalized by mouth corner width.</div>
+  <pre><code>&quot;&quot;&quot;Lip tracking.
+
+Two sources:
+  1. MediaPipe FaceLandmarker (tasks.vision API) on real video.
+  2. Precomputed JSON (used by the QC test set and for re-running scoring).
+
+Lip opening = distance(upper inner lip, lower inner lip) / distance(mouth corners).
+&quot;&quot;&quot;
+import json
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+
+UPPER, LOWER, LEFT, RIGHT = 13, 14, 61, 291
+MODEL_URL = &quot;https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task&quot;
+
+
+def opening_from_landmarks(lm) -&gt; float:
+    def d(a, b):
+        return float(np.hypot(lm[a][0] - lm[b][0], lm[a][1] - lm[b][1]))
+    return d(UPPER, LOWER) / max(d(LEFT, RIGHT), 1e-6)
+
+
+def _ensure_task_model() -&gt; Path:
+    p = Path(__file__).resolve().parent.parent / &quot;config&quot; / &quot;models&quot; / &quot;face_landmarker.task&quot;
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists() or p.stat().st_size &lt; 1000:
+        urllib.request.urlretrieve(MODEL_URL, str(p))
+    return p
+
+
+def track_video_mediapipe(video: Path, fps_sample: float = 25.0):
+    &quot;&quot;&quot;Return (t_seconds, opening) arrays using MediaPipe FaceLandmarker.&quot;&quot;&quot;
+    try:
+        import cv2
+        import mediapipe as mp
+    except ImportError as e:
+        raise RuntimeError(&quot;MediaPipe/OpenCV not installed; use requirements-ml.txt&quot;) from e
+
+    cap = cv2.VideoCapture(str(video))
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    step = max(1, int(round(src_fps / fps_sample)))
+
+    # Support both legacy mediapipe solutions and modern mediapipe.tasks.vision
+    if hasattr(mp, &quot;solutions&quot;) and hasattr(mp.solutions, &quot;face_mesh&quot;):
+        face = mp.solutions.face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
+        ts, vals, idx = [], [], 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % step == 0:
+                res = face.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                t = idx / src_fps
+                if res.multi_face_landmarks:
+                    lm = [(p.x, p.y) for p in res.multi_face_landmarks[0].landmark]
+                    vals.append(opening_from_landmarks(lm))
+                else:
+                    vals.append(np.nan)
+                ts.append(t)
+            idx += 1
+        cap.release()
+        face.close()
+        return np.array(ts), np.array(vals, dtype=float)
+
+    # Modern mediapipe Tasks Vision API
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+
+    model_path = _ensure_task_model()
+    base_options = python.BaseOptions(model_asset_path=str(model_path))
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        num_faces=1
+    )
+
+    ts, vals, idx = [], [], 0
+    with vision.FaceLandmarker.create_from_options(options) as landmarker:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % step == 0:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                timestamp_ms = int(round((idx / src_fps) * 1000))
+                res = landmarker.detect_for_video(mp_img, timestamp_ms)
+                t = idx / src_fps
+                if res.face_landmarks:
+                    lm = [(p.x, p.y) for p in res.face_landmarks[0]]
+                    vals.append(opening_from_landmarks(lm))
+                else:
+                    vals.append(np.nan)
+                ts.append(t)
+            idx += 1
+    cap.release()
+    return np.array(ts), np.array(vals, dtype=float)
+
+
+def load_precomputed(path: Path):
+    &quot;&quot;&quot;JSON: {&quot;fps&quot;: 25, &quot;opening&quot;: [...]} or {&quot;t&quot;: [...], &quot;opening&quot;: [...]}&quot;&quot;&quot;
+    data = json.loads(Path(path).read_text(encoding=&quot;utf-8&quot;))
+    op = np.array(data[&quot;opening&quot;], dtype=float)
+    if &quot;t&quot; in data:
+        t = np.array(data[&quot;t&quot;], dtype=float)
+    else:
+        t = np.arange(op.size) / float(data.get(&quot;fps&quot;, 25.0))
+    return t, op
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/pipeline.py — Master Orchestration Pipeline</h3>
+  <div class="desc">Coordinates audio extraction, Gemini ASR, MediaPipe lip tracking, drift math, lexical alignment, LLM emotion evaluation, and saves all JSON artifacts locally.</div>
+  <pre><code>&quot;&quot;&quot;End-to-end run for one batch.
+
+mode=&quot;precomputed&quot;: uses word and lip JSON files under &lt;run&gt;/precomputed/ (QC and offline).
+mode=&quot;full&quot;:        uses faster-whisper and MediaPipe on the real media (needs requirements-ml.txt).
+&quot;&quot;&quot;
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+
+from core import align, asr, judge_gemini, lang, lips, media, pairwise, scoring, timing, vad
+from core import info as ginfo
+from core.manifest import load_manifest
+
+log = logging.getLogger(&quot;dubqa&quot;)
+
+
+def _write(path: Path, data) -&gt; None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding=&quot;utf-8&quot;)
+
+
+def _status(run_dir: Path, status: str, **extra) -&gt; None:
+    meta_p = run_dir / &quot;run_meta.json&quot;
+    meta = json.loads(meta_p.read_text(encoding=&quot;utf-8&quot;)) if meta_p.exists() else {}
+    meta.update({&quot;status&quot;: status, &quot;updated&quot;: datetime.now(timezone.utc).isoformat()}, **extra)
+    _write(meta_p, meta)
+
+
+def _words_and_lips(mode, run_dir, wav, video, pre_words, pre_lips, lang):
+    if mode == &quot;precomputed&quot;:
+        words = asr.load_words(pre_words)
+        t, op = lips.load_precomputed(pre_lips)
+    else:
+        words = asr.transcribe_words(wav, lang)
+        t, op = lips.track_video_mediapipe(video)
+    return words, t, op
+
+
+def run(run_dir: Path, mode: str = &quot;precomputed&quot;, use_judge: bool = False, use_gemini: bool = True) -&gt; dict:
+    run_dir = Path(run_dir)
+    man = load_manifest(run_dir / &quot;manifest.json&quot;)
+    th = scoring.load_thresholds()
+    inputs, work, pre = run_dir / &quot;inputs&quot;, run_dir / &quot;work&quot;, run_dir / &quot;precomputed&quot;
+    _status(run_dir, &quot;running&quot;, mode=mode)
+    log.info(&quot;run %s started (mode=%s, judge=%s, gemini=%s)&quot;, man[&quot;run_id&quot;], mode, use_judge, use_gemini)
+    try:
+        log.info(&quot;source: %s&quot;, man[&quot;source&quot;][&quot;file&quot;])
+        src_path = inputs / man[&quot;source&quot;][&quot;file&quot;]
+        src_info = media.probe(src_path)
+        src_wav = media.extract_audio_wav(src_path, work / &quot;source.wav&quot;)
+        src_words, t_s, op_s = _words_and_lips(
+            mode, run_dir, src_wav, src_path,
+            pre / &quot;source_words.json&quot;, pre / &quot;source_lips.json&quot;, man[&quot;source&quot;].get(&quot;lang&quot;))
+        # Persist extracted words and lips for full auditability
+        _write(run_dir / &quot;words&quot; / &quot;source_words.json&quot;, src_words)
+        _write(run_dir / &quot;lips&quot; / &quot;source_lips.json&quot;, {&quot;t&quot;: t_s.tolist() if hasattr(t_s, &quot;tolist&quot;) else list(t_s),
+                                                       &quot;opening&quot;: op_s.tolist() if hasattr(op_s, &quot;tolist&quot;) else list(op_s)})
+        src_w = src_words[&quot;words&quot;]
+        src_sent = src_words.get(&quot;sentences&quot;, [])
+        src_speech_s = _speech_total(src_wav)
+
+        src_det = lang.detect_for_words(src_w, src_words.get(&quot;language&quot;))
+        src_ext = ginfo.extract_video(src_path, run_dir / &quot;gemini&quot; / &quot;source.json&quot;, use_gemini)
+        if src_det[&quot;lang&quot;] is None and src_ext.get(&quot;language&quot;):
+            src_det = {&quot;lang&quot;: src_ext[&quot;language&quot;], &quot;method&quot;: &quot;gemini&quot;, &quot;script&quot;: None, &quot;confidence&quot;: 1.0, &quot;note&quot;: &quot;&quot;}
+        src_lang, src_lang_notes = lang.resolve(man[&quot;source&quot;].get(&quot;lang&quot;), src_det[&quot;lang&quot;])
+        log.info(&quot;source language: %s (declared=%s, detected=%s via %s)&quot;, src_lang,
+                 man[&quot;source&quot;].get(&quot;lang&quot;), src_det[&quot;lang&quot;], src_det[&quot;method&quot;])
+
+        results = {&quot;run_id&quot;: man[&quot;run_id&quot;], &quot;mode&quot;: mode, &quot;generated&quot;: datetime.now(timezone.utc).isoformat(),
+                   &quot;thresholds_version&quot;: th[&quot;version&quot;], &quot;source&quot;: {**src_info, &quot;file&quot;: src_path.name,
+                   &quot;words&quot;: len(src_w), &quot;speech_s&quot;: src_speech_s, &quot;language&quot;: src_lang},
+                   &quot;outputs&quot;: {}, &quot;segments&quot;: [], &quot;pairs&quot;: {}, &quot;notes&quot;: [],
+                   &quot;languages&quot;: {&quot;source&quot;: {&quot;declared&quot;: man[&quot;source&quot;].get(&quot;lang&quot;), &quot;resolved&quot;: src_lang,
+                                            &quot;detection&quot;: src_det, &quot;notes&quot;: src_lang_notes}},
+                   &quot;gemini_source&quot;: _gemini_brief(src_ext), &quot;info&quot;: {},
+                   &quot;required_data&quot;: ginfo.checklist(run_dir, man, mode, use_gemini)}
+        # segments = source sentences (shared by every output)
+        for i, s in enumerate(src_sent, start=1):
+            results[&quot;segments&quot;].append({&quot;seg&quot;: i, &quot;start&quot;: s[&quot;start&quot;], &quot;end&quot;: s[&quot;end&quot;], &quot;text&quot;: s[&quot;text&quot;]})
+
+        values_by_out: dict[str, dict] = {}
+        for o in man[&quot;outputs&quot;]:
+            oid = o[&quot;output_id&quot;]
+            path = inputs / o[&quot;file&quot;]
+            log.info(&quot;measuring %s (%s)&quot;, oid, o[&quot;vendor&quot;])
+            info = media.probe(path)
+            wav = media.extract_audio_wav(path, work / f&quot;{oid}.wav&quot;)
+            samples, sr = media.read_wav_mono(wav)
+            speech = vad.speech_intervals(samples, sr)
+            dwords, t, op = _words_and_lips(mode, run_dir, wav, path, pre / f&quot;{oid}_words.json&quot;,
+                                            pre / f&quot;{oid}_lips.json&quot;, man.get(&quot;target_lang&quot;))
+            # Persist extracted words and lips locally for each dub output
+            _write(run_dir / &quot;words&quot; / f&quot;{oid}_words.json&quot;, dwords)
+            _write(run_dir / &quot;lips&quot; / f&quot;{oid}_lips.json&quot;, {&quot;t&quot;: t.tolist() if hasattr(t, &quot;tolist&quot;) else list(t),
+                                                           &quot;opening&quot;: op.tolist() if hasattr(op, &quot;tolist&quot;) else list(op)})
+            d_w = dwords[&quot;words&quot;]
+            dub_det = lang.detect_for_words(d_w, dwords.get(&quot;language&quot;))
+            dub_ext = ginfo.extract_video(path, run_dir / &quot;gemini&quot; / f&quot;{oid}.json&quot;, use_gemini)
+            if dub_det[&quot;lang&quot;] is None and dub_ext.get(&quot;language&quot;):
+                dub_det = {&quot;lang&quot;: dub_ext[&quot;language&quot;], &quot;method&quot;: &quot;gemini&quot;, &quot;script&quot;: None, &quot;confidence&quot;: 1.0, &quot;note&quot;: &quot;&quot;}
+            dub_lang, dub_lang_notes = lang.resolve(man.get(&quot;target_lang&quot;), dub_det[&quot;lang&quot;])
+            log.info(&quot;%s language: %s (declared=%s, detected=%s via %s)&quot;, oid, dub_lang,
+                     man.get(&quot;target_lang&quot;), dub_det[&quot;lang&quot;], dub_det[&quot;method&quot;])
+            gem_summary = ginfo.summarize(src_ext, dub_ext)
+            thr = timing.speaker_threshold(op)
+            drifts = timing.word_drifts(d_w, t, op, thr)
+            pairs, missing, extra = align.align_words(src_w, d_w)
+
+            starts = [abs(d_w[j][&quot;start&quot;] - src_w[i][&quot;start&quot;]) * 1000 for i, j in pairs]
+            dub_speech = _speech_total(wav)
+            values = {
+                &quot;translation_fidelity&quot;: align.lexical_fidelity(src_w, pairs),
+                &quot;word_count_diff&quot;: round(100.0 * abs(len(d_w) - len(src_w)) / max(len(src_w), 1), 1),
+                &quot;syllable_ratio&quot;: round(dub_speech / src_speech_s, 3) if src_speech_s else None,
+                &quot;timing_drift_ms&quot;: round(float(np.median(starts)), 1) if starts else None,
+                &quot;onset_drift_ms&quot;: timing.median_abs([d[&quot;onset_ms&quot;] for d in drifts]),
+                &quot;tail_drift_ms&quot;: timing.median_abs([d[&quot;tail_ms&quot;] for d in drifts]),
+                &quot;open_ratio_pct&quot;: timing.open_ratio_during_speech(t, op, thr, speech),
+                &quot;false_movement_pct&quot;: timing.false_movement(t, op, thr, speech),
+                &quot;word_pass_rate_pct&quot;: timing.word_pass_rate(drifts),
+                &quot;missing_sentences&quot;: align.missing_sentences(src_sent, src_w, pairs) if src_sent else None,
+                &quot;hallucinations&quot;: None,
+                &quot;emotion_match_pct&quot;: None,
+                &quot;tone_match_pct&quot;: None,
+                &quot;audio_quality&quot;: None,
+            }
+            extras = {&quot;duration_s&quot;: info[&quot;duration_s&quot;],
+                      &quot;duration_diff_pct&quot;: timing.duration_diff_pct(info[&quot;duration_s&quot;], src_info[&quot;duration_s&quot;]),
+                      &quot;wpm_ratio&quot;: timing.speech_rate_ratio(len(d_w), info[&quot;duration_s&quot;], len(src_w),
+                                                           src_info[&quot;duration_s&quot;]),
+                      &quot;av_offset_ms&quot;: timing.av_offset_ms(t, op, speech),
+                      &quot;missing_words&quot;: missing[:50], &quot;extra_words&quot;: extra[:50],
+                      &quot;translation_method&quot;: &quot;lexical-proxy&quot; if mode == &quot;precomputed&quot; else &quot;lexical-proxy (COMET not wired yet)&quot;,
+                      &quot;speaker_threshold&quot;: None if np.isnan(thr) else round(float(thr), 4)}
+
+            if use_judge and os.environ.get(&quot;GEMINI_API_KEY&quot;):
+                judged = _judge_outputs(run_dir, path, oid, results[&quot;segments&quot;], d_w, src_w, values, extras)
+                values.update(judged[&quot;values&quot;])
+                extras[&quot;judge_notes&quot;] = judged[&quot;notes&quot;]
+
+            if values.get(&quot;emotion_match_pct&quot;) is None and gem_summary.get(&quot;emotion_match_pct&quot;) is not None:
+                values[&quot;emotion_match_pct&quot;] = gem_summary[&quot;emotion_match_pct&quot;]
+                extras[&quot;emotion_source&quot;] = &quot;Gemini labels, compared by code&quot;
+            results[&quot;info&quot;][oid] = {
+                &quot;language&quot;: {&quot;declared&quot;: man.get(&quot;target_lang&quot;), &quot;resolved&quot;: dub_lang,
+                             &quot;detection&quot;: dub_det, &quot;notes&quot;: dub_lang_notes},
+                &quot;gemini&quot;: _gemini_brief(dub_ext),
+                &quot;summary&quot;: gem_summary,
+            }
+            _write(run_dir / &quot;measure&quot; / f&quot;{oid}.json&quot;, {&quot;drifts&quot;: drifts, &quot;speech&quot;: speech, &quot;lips_t_len&quot;: int(t.size)})
+            values_by_out[oid] = values
+            sc = scoring.score_output(values, th)
+            log.info(&quot;%s done: overall=%s coverage=%s%%&quot;, oid, sc.get(&quot;overall&quot;), sc.get(&quot;coverage_pct&quot;))
+            results[&quot;outputs&quot;][oid] = {&quot;output_id&quot;: oid, &quot;vendor&quot;: o[&quot;vendor&quot;], &quot;file&quot;: o[&quot;file&quot;],
+                                       &quot;values&quot;: values, &quot;extras&quot;: extras, &quot;score&quot;: sc}
+
+        ranks = scoring.rank_outputs({k: v[&quot;score&quot;][&quot;overall&quot;] for k, v in results[&quot;outputs&quot;].items()})
+        for k, r in ranks.items():
+            results[&quot;outputs&quot;][k][&quot;overall_rank&quot;] = r
+        log.info(&quot;ranking and pairwise comparison&quot;)
+        cmp = pairwise.compare_all(values_by_out, th)
+        results[&quot;pairs&quot;] = cmp[&quot;pairs&quot;]
+        results[&quot;win_matrix&quot;] = cmp[&quot;win_matrix&quot;]
+        _write(run_dir / &quot;results.json&quot;, results)
+        _status(run_dir, &quot;done&quot;)
+        log.info(&quot;run finished&quot;)
+        return results
+    except Exception as e:  # keep the error visible in the status file
+        log.exception(&quot;run failed&quot;)
+        _status(run_dir, &quot;failed&quot;, error=str(e))
+        raise
+
+
+def _speech_total(wav: Path) -&gt; float:
+    samples, sr = media.read_wav_mono(wav)
+    return round(sum(e - s for s, e in vad.speech_intervals(samples, sr)), 3)
+
+
+def _gemini_brief(ext: dict) -&gt; dict:
+    &quot;&quot;&quot;Status of one Gemini extraction, without the full segment list (that is in the cache file).&quot;&quot;&quot;
+    return {&quot;status&quot;: ext.get(&quot;status&quot;), &quot;reason&quot;: ext.get(&quot;reason&quot;, &quot;&quot;), &quot;model&quot;: ext.get(&quot;model&quot;),
+            &quot;language&quot;: ext.get(&quot;language&quot;), &quot;segments&quot;: len(ext.get(&quot;segments&quot;, []) or []),
+            &quot;dropped_segments&quot;: ext.get(&quot;dropped_segments&quot;, 0)}
+
+
+def _judge_outputs(run_dir, path, oid, segments, d_w, src_w, values, extras):
+    notes, em, tm = [], [], []
+    for seg in segments:
+        clip = media.trim_clip(path, seg[&quot;start&quot;], seg[&quot;end&quot;], run_dir / &quot;judge&quot; / f&quot;{seg[&#x27;seg&#x27;]:02d}__{oid}.mp4&quot;)
+        dub_text = &quot; &quot;.join(w[&quot;word&quot;] for w in d_w if seg[&quot;start&quot;] &lt;= w[&quot;start&quot;] &lt; seg[&quot;end&quot;])
+        measured = {&quot;fidelity&quot;: values.get(&quot;translation_fidelity&quot;), &quot;onset_ms&quot;: values.get(&quot;onset_drift_ms&quot;)}
+        prompt = judge_gemini.build_prompt(seg[&quot;text&quot;], dub_text, measured)
+        res = judge_gemini.judge_clip(clip, prompt) or {}
+        notes.append({&quot;seg&quot;: seg[&quot;seg&quot;], **res})
+        if res.get(&quot;status&quot;) == &quot;ok&quot;:
+            em.append(bool(res.get(&quot;emotion_match&quot;)))
+            tm.append(bool(res.get(&quot;tone_match&quot;)))
+    out = {&quot;values&quot;: {}, &quot;notes&quot;: notes}
+    if em:
+        out[&quot;values&quot;][&quot;emotion_match_pct&quot;] = round(100.0 * sum(em) / len(em), 1)
+    if tm:
+        out[&quot;values&quot;][&quot;tone_match_pct&quot;] = round(100.0 * sum(tm) / len(tm), 1)
+    return out
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/align.py — Lexical Word Alignment & Matching</h3>
+  <div class="desc">Fast Dynamic Time Warping (DTW) and edit distance matching between source and dubbed words, detecting missing and hallucinated words.</div>
+  <pre><code>&quot;&quot;&quot;Word and sentence alignment between source and dub transcripts.&quot;&quot;&quot;
+import difflib
+import unicodedata
+
+
+def norm(word: str) -&gt; str:
+    &quot;&quot;&quot;Lowercase, punctuation and symbols removed. Combining marks are kept, so Hindi words stay whole.&quot;&quot;&quot;
+    return &quot;&quot;.join(ch for ch in word if not unicodedata.category(ch).startswith((&quot;P&quot;, &quot;S&quot;))).lower()
+
+
+def align_words(src_words: list[dict], dub_words: list[dict]):
+    &quot;&quot;&quot;Return matched pairs (src_idx, dub_idx) and lists of missing/extra source words.&quot;&quot;&quot;
+    a = [norm(w[&quot;word&quot;]) for w in src_words]
+    b = [norm(w[&quot;word&quot;]) for w in dub_words]
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    pairs, matched_src = [], set()
+    for block in sm.get_matching_blocks():
+        for k in range(block.size):
+            pairs.append((block.a + k, block.b + k))
+            matched_src.add(block.a + k)
+    missing = [src_words[i][&quot;word&quot;] for i in range(len(a)) if i not in matched_src]
+    matched_dub = {j for _, j in pairs}
+    extra = [dub_words[j][&quot;word&quot;] for j in range(len(b)) if j not in matched_dub]
+    return pairs, missing, extra
+
+
+def lexical_fidelity(src_words, pairs) -&gt; float | None:
+    if not src_words:
+        return None
+    return round(100.0 * len(pairs) / len(src_words), 1)
+
+
+def missing_sentences(sentences: list[dict], src_words, pairs) -&gt; int:
+    &quot;&quot;&quot;A source sentence is missing when less than half of its words are matched.&quot;&quot;&quot;
+    matched = {i for i, _ in pairs}
+    missing = 0
+    for s in sentences:
+        idx = [i for i, w in enumerate(src_words) if s[&quot;start&quot;] &lt;= w[&quot;start&quot;] &lt; s[&quot;end&quot;] + 1e-6]
+        if idx and sum(1 for i in idx if i in matched) / len(idx) &lt; 0.5:
+            missing += 1
+    return missing
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/timing.py — Drift & Synchronization Mathematics</h3>
+  <div class="desc">Calculates onset drift (ms), tail drift (ms), false movement percentage during silence, open ratio, and audio-visual offsets.</div>
+  <pre><code>&quot;&quot;&quot;Timing metrics. Pure numpy so every function can be unit-tested without models.
+
+Units: time in seconds in, milliseconds out where the name says _ms.
+&quot;&quot;&quot;
+import numpy as np
+
+from core.vad import in_any
+
+ONSET_WINDOW = (-0.30, 0.50)   # search window around word start
+TAIL_WINDOW = (-0.20, 0.50)    # search from slightly before word end (early close = negative tail)
+
+
+def speaker_threshold(opening: np.ndarray) -&gt; float:
+    valid = opening[~np.isnan(opening)]
+    if valid.size == 0:
+        return float(&quot;nan&quot;)
+    return 0.20 * float(np.percentile(valid, 95))
+
+
+def word_drifts(words: list[dict], t: np.ndarray, opening: np.ndarray, thr: float):
+    &quot;&quot;&quot;Per word: onset_ms, tail_ms (None when no mouth event found in the window).&quot;&quot;&quot;
+    out = []
+    for w in words:
+        s, e = float(w[&quot;start&quot;]), float(w[&quot;end&quot;])
+        onset = None
+        m = (t &gt;= s + ONSET_WINDOW[0]) &amp; (t &lt;= s + ONSET_WINDOW[1]) &amp; (opening &gt; thr)
+        if m.any():
+            onset = (t[np.argmax(m)] - s) * 1000.0
+        tail = None
+        m2 = (t &gt;= e + TAIL_WINDOW[0]) &amp; (t &lt;= e + TAIL_WINDOW[1]) &amp; (opening &lt; thr)
+        if m2.any():
+            tail = (t[np.argmax(m2)] - e) * 1000.0
+        out.append({&quot;word&quot;: w.get(&quot;word&quot;, &quot;&quot;), &quot;start&quot;: s, &quot;end&quot;: e,
+                    &quot;onset_ms&quot;: None if onset is None else round(onset, 1),
+                    &quot;tail_ms&quot;: None if tail is None else round(tail, 1)})
+    return out
+
+
+def word_pass_rate(drifts: list[dict], good_ms: float = 80.0):
+    scored = [d for d in drifts if d[&quot;onset_ms&quot;] is not None and d[&quot;tail_ms&quot;] is not None]
+    if not drifts:
+        return None
+    ok = sum(1 for d in scored if abs(d[&quot;onset_ms&quot;]) &lt; good_ms and abs(d[&quot;tail_ms&quot;]) &lt; good_ms)
+    return round(100.0 * ok / len(drifts), 1)   # unmatched words count as fails
+
+
+def median_abs(values) -&gt; float | None:
+    vals = [abs(v) for v in values if v is not None]
+    return round(float(np.median(vals)), 1) if vals else None
+
+
+def open_ratio_during_speech(t, opening, thr, speech) -&gt; float | None:
+    mask = np.array([in_any(x, speech) for x in t])
+    if not mask.any():
+        return None
+    return round(100.0 * float(np.mean(opening[mask] &gt; thr)), 1)
+
+
+def false_movement(t, opening, thr, speech) -&gt; float | None:
+    mask = np.array([not in_any(x, speech) for x in t])
+    if not mask.any():
+        return None
+    return round(100.0 * float(np.mean(opening[mask] &gt; thr)), 1)
+
+
+def av_offset_ms(t_lips, opening, speech, max_lag_ms: float = 500.0) -&gt; float | None:
+    &quot;&quot;&quot;Lag (ms) that best aligns the lip-open signal with the speech signal.
+    Positive = mouth moves after the audio.&quot;&quot;&quot;
+    if t_lips.size &lt; 4 or not speech:
+        return None
+    grid = np.arange(0, t_lips[-1], 0.01)
+    if grid.size &lt; 4:
+        return None
+    speech_sig = np.array([1.0 if in_any(x, speech) else 0.0 for x in grid])
+    lip = np.interp(grid, t_lips, np.nan_to_num(opening, nan=0.0))
+    a = speech_sig - speech_sig.mean()
+    b = lip - lip.mean()
+    lags = np.arange(-int(max_lag_ms / 10), int(max_lag_ms / 10) + 1)
+    best, best_lag = -np.inf, 0
+    for k in lags:
+        if k &gt;= 0:
+            x, y = a[: a.size - k], b[k:]
+        else:
+            x, y = a[-k:], b[: b.size + k]
+        if x.size == 0:
+            continue
+        c = float(np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-9))
+        if c &gt; best:
+            best, best_lag = c, k
+    return float(best_lag * 10)
+
+
+def speech_rate_ratio(dub_words: int, dub_dur: float, src_words: int, src_dur: float):
+    if min(dub_dur, src_dur, src_words) &lt;= 0:
+        return None
+    return round((dub_words / dub_dur) / (src_words / src_dur), 3)
+
+
+def duration_diff_pct(dub_dur: float, src_dur: float) -&gt; float | None:
+    if src_dur &lt;= 0:
+        return None
+    return round(100.0 * abs(dub_dur - src_dur) / src_dur, 2)
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/scoring.py — Weighted Multi-Metric Scoring</h3>
+  <div class="desc">Applies YAML thresholds and metric group weights to compute overall scores (0-100) and coverage percentages without vendor bias.</div>
+  <pre><code>&quot;&quot;&quot;Turn measured values into Good / Check / Fix labels and an overall score.
+
+Missing values (None) are never treated as a pass. They are excluded and
+reported through coverage.
+&quot;&quot;&quot;
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def load_thresholds(path: Path | None = None) -&gt; dict:
+    p = path or ROOT / &quot;config&quot; / &quot;thresholds.yaml&quot;
+    return yaml.safe_load(p.read_text(encoding=&quot;utf-8&quot;))
+
+
+def label(key: str, value, th: dict) -&gt; str | None:
+    if value is None:
+        return None
+    m = th[&quot;metrics&quot;][key]
+    d = m[&quot;direction&quot;]
+    if d == &quot;min&quot;:
+        return &quot;Good&quot; if value &gt;= m[&quot;good&quot;] else (&quot;Check&quot; if value &gt;= m[&quot;check&quot;] else &quot;Fix&quot;)
+    if d == &quot;max&quot;:
+        return &quot;Good&quot; if value &lt;= m[&quot;good&quot;] else (&quot;Check&quot; if value &lt;= m[&quot;check&quot;] else &quot;Fix&quot;)
+    if d == &quot;max_abs&quot;:
+        v = abs(value)
+        return &quot;Good&quot; if v &lt;= m[&quot;good&quot;] else (&quot;Check&quot; if v &lt;= m[&quot;check&quot;] else &quot;Fix&quot;)
+    if d == &quot;band&quot;:
+        if m[&quot;low&quot;] &lt;= value &lt;= m[&quot;high&quot;]:
+            return &quot;Good&quot;
+        if m[&quot;check_low&quot;] &lt;= value &lt;= m[&quot;check_high&quot;]:
+            return &quot;Check&quot;
+        return &quot;Fix&quot;
+    raise ValueError(f&quot;unknown direction for {key}: {d}&quot;)
+
+
+POINTS = {&quot;Good&quot;: 1.0, &quot;Check&quot;: 0.5, &quot;Fix&quot;: 0.0}
+
+
+def score_output(values: dict, th: dict) -&gt; dict:
+    &quot;&quot;&quot;values: metric_key -&gt; measured value (or None). Returns labels, group scores, overall.&quot;&quot;&quot;
+    labels = {k: label(k, values.get(k), th) for k in th[&quot;metrics&quot;]}
+    groups: dict[str, list[float]] = {}
+    for k, lab in labels.items():
+        if lab is None:
+            continue
+        g = th[&quot;metrics&quot;][k][&quot;group&quot;]
+        groups.setdefault(g, []).append(POINTS[lab])
+    group_scores = {g: round(100.0 * sum(v) / len(v), 1) for g, v in groups.items()}
+    weights = th[&quot;group_weights&quot;]
+    used = {g: weights[g] for g in group_scores if g in weights}
+    total_w = sum(used.values())
+    overall = round(sum(group_scores[g] * w for g, w in used.items()) / total_w, 1) if total_w else None
+    measured = sum(1 for lab in labels.values() if lab is not None)
+    coverage = round(100.0 * measured / len(labels), 1)
+    fixes = [k for k, lab in labels.items() if lab == &quot;Fix&quot;]
+    gate = th[&quot;release_gate&quot;]
+    critical_fail = any(k in (&quot;missing_sentences&quot;, &quot;hallucinations&quot;) and labels[k] == &quot;Fix&quot; for k in labels)
+    approved = (overall is not None and overall &gt;= gate[&quot;min_overall&quot;]
+                and coverage &gt;= 100 - gate[&quot;max_missing_coverage_pct&quot;]
+                and not critical_fail and not fixes)
+    return {&quot;labels&quot;: labels, &quot;group_scores&quot;: group_scores, &quot;overall&quot;: overall,
+            &quot;coverage_pct&quot;: coverage, &quot;fix_metrics&quot;: fixes,
+            &quot;release&quot;: &quot;Approved&quot; if approved else (&quot;Review&quot; if overall is not None else &quot;Not measured&quot;)}
+
+
+def rank_outputs(scores: dict[str, float | None]) -&gt; dict[str, str]:
+    &quot;&quot;&quot;Competition ranking with ties (1, 1, 3). None ranks last with no rank.&quot;&quot;&quot;
+    ranked = sorted([(v, k) for k, v in scores.items() if v is not None], key=lambda x: -x[0])
+    out, prev, pos = {}, None, 0
+    for i, (v, k) in enumerate(ranked, start=1):
+        if v != prev:
+            pos = i
+            prev = v
+        tied = sum(1 for vv, _ in ranked if vv == v)
+        out[k] = f&quot;{pos} (tie)&quot; if tied &gt; 1 else str(pos)
+    for k, v in scores.items():
+        if v is None:
+            out[k] = &quot;—&quot;
+    return out
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/pairwise.py — Head-to-Head Pairwise Comparison Matrix</h3>
+  <div class="desc">Compares every dubbed output against every other output across all metrics to compute wins, losses, ties, and tournament rankings.</div>
+  <pre><code>&quot;&quot;&quot;Every dub against every other dub. Winner per metric uses the tie tolerances.&quot;&quot;&quot;
+from itertools import combinations
+
+
+def better(key: str, a, b, th: dict) -&gt; str:
+    &quot;&quot;&quot;Return &#x27;a&#x27;, &#x27;b&#x27; or &#x27;tie&#x27; for one metric.&quot;&quot;&quot;
+    if a is None or b is None:
+        return &quot;n/a&quot;
+    m = th[&quot;metrics&quot;][key]
+    tol = th[&quot;tie_tolerance&quot;].get(key, 0)
+    d = m[&quot;direction&quot;]
+    if d == &quot;band&quot;:
+        mid = (m[&quot;low&quot;] + m[&quot;high&quot;]) / 2
+        a2, b2 = abs(a - mid), abs(b - mid)
+        lower_better = True
+        a, b = a2, b2
+    elif d in (&quot;max&quot;, &quot;max_abs&quot;):
+        lower_better = True
+        if d == &quot;max_abs&quot;:
+            a, b = abs(a), abs(b)
+    else:
+        lower_better = False
+    if abs(a - b) &lt;= tol:
+        return &quot;tie&quot;
+    if lower_better:
+        return &quot;a&quot; if a &lt; b else &quot;b&quot;
+    return &quot;a&quot; if a &gt; b else &quot;b&quot;
+
+
+def compare_all(outputs: dict[str, dict], th: dict) -&gt; dict:
+    &quot;&quot;&quot;outputs: output_id -&gt; metric values. Returns pair results and a win matrix.&quot;&quot;&quot;
+    ids = list(outputs)
+    pairs = {}
+    wins = {i: {j: 0 for j in ids} for i in ids}
+    for a, b in combinations(ids, 2):
+        per_metric = {}
+        score_a = score_b = 0
+        for k in th[&quot;metrics&quot;]:
+            r = better(k, outputs[a].get(k), outputs[b].get(k), th)
+            if r == &quot;a&quot;:
+                score_a += 1
+                wins[a][b] += 1
+                per_metric[k] = a
+            elif r == &quot;b&quot;:
+                score_b += 1
+                wins[b][a] += 1
+                per_metric[k] = b
+            else:
+                per_metric[k] = r
+        pairs[f&quot;{a} vs {b}&quot;] = {&quot;a&quot;: a, &quot;b&quot;: b, &quot;wins_a&quot;: score_a, &quot;wins_b&quot;: score_b,
+                                &quot;per_metric&quot;: per_metric}
+    return {&quot;pairs&quot;: pairs, &quot;win_matrix&quot;: wins}
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/judge_gemini.py — Gemini Per-Segment Emotion Judge</h3>
+  <div class="desc">Calls Gemini with video segment payloads to evaluate emotion match, tone preservation, and semantic integrity.</div>
+  <pre><code>&quot;&quot;&quot;Gemini calls. One shared upload-and-generate helper, used by the extractor and the judge.
+
+Timing numbers are never produced here. Gemini returns labels and transcripts; code measures.
+Skipped cleanly when GEMINI_API_KEY or google-genai is missing.
+&quot;&quot;&quot;
+import json
+import os
+import time
+from pathlib import Path
+
+SCHEMA_HINT = &quot;&quot;&quot;Return ONLY JSON with this shape:
+{&quot;emotion_src&quot;: &quot;&quot;, &quot;emotion_dub&quot;: &quot;&quot;, &quot;emotion_match&quot;: true,
+ &quot;tone_src&quot;: &quot;&quot;, &quot;tone_dub&quot;: &quot;&quot;, &quot;tone_match&quot;: true,
+ &quot;meaning_preserved&quot;: true,
+ &quot;issues&quot;: [{&quot;time_s&quot;: 0.0, &quot;type&quot;: &quot;&quot;, &quot;note&quot;: &quot;&quot;}],
+ &quot;summary&quot;: &quot;&quot;}&quot;&quot;&quot;
+
+
+def build_prompt(seg_text_src: str, seg_text_dub: str, measured: dict) -&gt; str:
+    return (
+        &quot;You are a dubbing QA reviewer. Watch and listen to the clip.\n&quot;
+        f&quot;Source text: {seg_text_src}\nDubbed text: {seg_text_dub}\n&quot;
+        f&quot;Measured facts (do not change these): {json.dumps(measured)}\n&quot;
+        &quot;Judge emotion, tone and meaning only. Do not estimate timing or lip-sync.\n&quot;
+        + SCHEMA_HINT
+    )
+
+
+def gemini_available() -&gt; tuple[bool, str]:
+    if not os.environ.get(&quot;GEMINI_API_KEY&quot;):
+        return False, &quot;GEMINI_API_KEY not set&quot;
+    try:
+        import google.genai  # noqa: F401
+    except ImportError:
+        return False, &quot;google-genai not installed&quot;
+    return True, &quot;ok&quot;
+
+
+def call_gemini_json(media_path: Path, prompt: str) -&gt; dict:
+    &quot;&quot;&quot;Upload a video or audio file, ask for JSON, return the parsed object plus status.&quot;&quot;&quot;
+    ok, reason = gemini_available()
+    if not ok:
+        return {&quot;status&quot;: &quot;skipped&quot;, &quot;reason&quot;: reason}
+    from google import genai
+    client = genai.Client(api_key=os.environ[&quot;GEMINI_API_KEY&quot;])
+    f = client.files.upload(file=str(media_path))
+    for _ in range(60):
+        if client.files.get(name=f.name).state.name == &quot;ACTIVE&quot;:
+            break
+        time.sleep(2)
+    model = os.environ.get(&quot;GEMINI_MODEL&quot;, &quot;gemini-3.8-flash&quot;)
+    resp = client.models.generate_content(
+        model=model, contents=[f, prompt],
+        config={&quot;response_mime_type&quot;: &quot;application/json&quot;})
+    try:
+        out = json.loads(resp.text)
+    except (json.JSONDecodeError, TypeError):
+        return {&quot;status&quot;: &quot;parse_error&quot;, &quot;raw&quot;: str(resp.text)[:500], &quot;model&quot;: model}
+    if not isinstance(out, dict):
+        return {&quot;status&quot;: &quot;parse_error&quot;, &quot;raw&quot;: str(resp.text)[:500], &quot;model&quot;: model}
+    out[&quot;status&quot;] = &quot;ok&quot;
+    out[&quot;model&quot;] = model
+    return out
+
+
+def judge_clip(clip: Path, prompt: str) -&gt; dict:
+    return call_gemini_json(clip, prompt)
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/vad.py — Voice Activity Detection (Energy VAD)</h3>
+  <div class="desc">Computes audio RMS energy envelope to detect voiced speech intervals and inter-word pauses without external AI models.</div>
+  <pre><code>&quot;&quot;&quot;Energy-based voice activity detection (no model needed).
+
+Frames of 20 ms. A frame is speech when its RMS is above an adaptive floor.
+Returns merged speech intervals in seconds.
+&quot;&quot;&quot;
+import numpy as np
+
+
+def speech_intervals(samples: np.ndarray, sr: int, frame_ms: int = 20,
+                     rel_db: float = -30.0, min_len_s: float = 0.08,
+                     merge_gap_s: float = 0.15) -&gt; list[tuple[float, float]]:
+    if samples.size == 0:
+        return []
+    n = int(sr * frame_ms / 1000)
+    n_frames = samples.size // n
+    if n_frames == 0:
+        return []
+    frames = samples[: n_frames * n].reshape(n_frames, n)
+    rms = np.sqrt((frames ** 2).mean(axis=1)) + 1e-9
+    ref = np.percentile(rms, 95)
+    thr = ref * (10 ** (rel_db / 20.0))
+    active = rms &gt; thr
+    intervals, start = [], None
+    for i, a in enumerate(active):
+        if a and start is None:
+            start = i
+        if not a and start is not None:
+            intervals.append([start, i]); start = None
+    if start is not None:
+        intervals.append([start, n_frames])
+    dt = frame_ms / 1000.0
+    secs = [(s * dt, e * dt) for s, e in intervals]
+    # merge close intervals
+    merged: list[list[float]] = []
+    for s, e in secs:
+        if merged and s - merged[-1][1] &lt;= merge_gap_s:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [(round(s, 3), round(e, 3)) for s, e in merged if e - s &gt;= min_len_s]
+
+
+def in_any(t: float, intervals) -&gt; bool:
+    return any(s &lt;= t &lt; e for s, e in intervals)
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/media.py — FFmpeg Audio & Video Utilities</h3>
+  <div class="desc">Probes video metadata, extracts 16kHz mono WAV streams, and reads raw PCM buffers for VAD and signal processing.</div>
+  <pre><code>&quot;&quot;&quot;FFmpeg / ffprobe helpers. All media work goes through here.&quot;&quot;&quot;
+import json
+import subprocess
+from pathlib import Path
+
+
+def _run(cmd: list[str]) -&gt; subprocess.CompletedProcess:
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f&quot;command failed: {&#x27; &#x27;.join(cmd)}\n{res.stderr[-800:]}&quot;)
+    return res
+
+
+def probe(path: Path) -&gt; dict:
+    res = _run([&quot;ffprobe&quot;, &quot;-v&quot;, &quot;error&quot;, &quot;-print_format&quot;, &quot;json&quot;,
+                &quot;-show_format&quot;, &quot;-show_streams&quot;, str(path)])
+    info = json.loads(res.stdout)
+    streams = info.get(&quot;streams&quot;, [])
+    v = next((s for s in streams if s.get(&quot;codec_type&quot;) == &quot;video&quot;), None)
+    a = next((s for s in streams if s.get(&quot;codec_type&quot;) == &quot;audio&quot;), None)
+    return {
+        &quot;duration_s&quot;: round(float(info[&quot;format&quot;].get(&quot;duration&quot;, 0.0)), 3),
+        &quot;has_video&quot;: v is not None,
+        &quot;has_audio&quot;: a is not None,
+        &quot;width&quot;: v.get(&quot;width&quot;) if v else None,
+        &quot;height&quot;: v.get(&quot;height&quot;) if v else None,
+        &quot;fps&quot;: v.get(&quot;r_frame_rate&quot;) if v else None,
+    }
+
+
+def extract_audio_wav(src: Path, dst: Path, sr: int = 16000) -&gt; Path:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _run([&quot;ffmpeg&quot;, &quot;-y&quot;, &quot;-i&quot;, str(src), &quot;-vn&quot;, &quot;-ac&quot;, &quot;1&quot;, &quot;-ar&quot;, str(sr),
+          &quot;-acodec&quot;, &quot;pcm_s16le&quot;, str(dst)])
+    return dst
+
+
+def read_wav_mono(path: Path):
+    &quot;&quot;&quot;Return (samples float32 in [-1,1], sample_rate) using the stdlib wave module.&quot;&quot;&quot;
+    import wave
+    import numpy as np
+    with wave.open(str(path), &quot;rb&quot;) as w:
+        sr = w.getframerate()
+        raw = w.readframes(w.getnframes())
+        width = w.getsampwidth()
+    dtype = {1: np.uint8, 2: np.int16, 4: np.int32}[width]
+    arr = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+    if width == 1:
+        arr = (arr - 128.0) / 128.0
+    else:
+        arr = arr / float(np.iinfo(dtype).max)
+    return arr, sr
+
+
+def trim_clip(src: Path, start_s: float, end_s: float, dst: Path) -&gt; Path:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _run([&quot;ffmpeg&quot;, &quot;-y&quot;, &quot;-ss&quot;, f&quot;{start_s:.3f}&quot;, &quot;-to&quot;, f&quot;{end_s:.3f}&quot;, &quot;-i&quot;, str(src),
+          &quot;-c:v&quot;, &quot;libx264&quot;, &quot;-preset&quot;, &quot;veryfast&quot;, &quot;-crf&quot;, &quot;30&quot;, &quot;-c:a&quot;, &quot;aac&quot;, &quot;-b:a&quot;, &quot;64k&quot;,
+          &quot;-movflags&quot;, &quot;+faststart&quot;, str(dst)])
+    return dst
+
+
+def make_web_copy(src: Path, dst: Path, height: int = 360) -&gt; Path:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _run([&quot;ffmpeg&quot;, &quot;-y&quot;, &quot;-i&quot;, str(src), &quot;-vf&quot;, f&quot;scale=-2:{height}&quot;,
+          &quot;-c:v&quot;, &quot;libx264&quot;, &quot;-preset&quot;, &quot;veryfast&quot;, &quot;-crf&quot;, &quot;32&quot;, &quot;-c:a&quot;, &quot;aac&quot;, &quot;-b:a&quot;, &quot;48k&quot;,
+          &quot;-ac&quot;, &quot;1&quot;, &quot;-movflags&quot;, &quot;+faststart&quot;, str(dst)])
+    return dst
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/lang.py — Language Detection & Resolution</h3>
+  <div class="desc">Combines ASR declared language with unicode script frequency heuristics and Gemini confidence to resolve spoken languages.</div>
+  <pre><code>&quot;&quot;&quot;Language detection and resolution.
+
+Order of evidence for each video:
+1. Whisper&#x27;s detected language (full mode), or a &quot;language&quot; field in the words JSON (precomputed).
+2. Gemini&#x27;s language field from the extraction (when Gemini ran).
+3. Unicode script of the transcript words. This identifies non-Latin scripts reliably
+   (Devanagari -&gt; hi, Tamil -&gt; ta, ...). Latin script cannot separate en, es, fr, de, so it
+   is reported as undetermined and the declared value is kept.
+
+A declared language in the manifest wins unless it is &quot;auto&quot; or missing. A disagreement
+with the detected language is recorded as a note, never silently overwritten.
+&quot;&quot;&quot;
+from collections import Counter
+
+# Script name, code, Unicode block. Devanagari covers hi, mr, ne: script alone cannot separate them.
+SCRIPTS = [
+    (&quot;Devanagari&quot;, &quot;hi&quot;, 0x0900, 0x097F),
+    (&quot;Bengali&quot;, &quot;bn&quot;, 0x0980, 0x09FF),
+    (&quot;Gurmukhi&quot;, &quot;pa&quot;, 0x0A00, 0x0A7F),
+    (&quot;Gujarati&quot;, &quot;gu&quot;, 0x0A80, 0x0AFF),
+    (&quot;Tamil&quot;, &quot;ta&quot;, 0x0B80, 0x0BFF),
+    (&quot;Telugu&quot;, &quot;te&quot;, 0x0C00, 0x0C7F),
+    (&quot;Kannada&quot;, &quot;kn&quot;, 0x0C80, 0x0CFF),
+    (&quot;Malayalam&quot;, &quot;ml&quot;, 0x0D00, 0x0D7F),
+    (&quot;Thai&quot;, &quot;th&quot;, 0x0E00, 0x0E7F),
+    (&quot;Arabic&quot;, &quot;ar&quot;, 0x0600, 0x06FF),
+    (&quot;Greek&quot;, &quot;el&quot;, 0x0370, 0x03FF),
+    (&quot;Cyrillic&quot;, &quot;ru&quot;, 0x0400, 0x04FF),
+    (&quot;Hangul&quot;, &quot;ko&quot;, 0xAC00, 0xD7AF),
+    (&quot;Kana&quot;, &quot;ja&quot;, 0x3040, 0x30FF),
+    (&quot;Han&quot;, &quot;zh&quot;, 0x4E00, 0x9FFF),
+]
+LATIN_RANGES = [(0x0041, 0x005A), (0x0061, 0x007A), (0x00C0, 0x024F)]
+
+
+def _is_latin(ch: str) -&gt; bool:
+    c = ord(ch)
+    return any(lo &lt;= c &lt;= hi for lo, hi in LATIN_RANGES)
+
+
+def detect_from_text(text: str) -&gt; dict:
+    counts: Counter = Counter()
+    latin = 0
+    for ch in text:
+        if not ch.isalpha():
+            continue
+        c = ord(ch)
+        hit = None
+        for name, code, lo, hi in SCRIPTS:
+            if lo &lt;= c &lt;= hi:
+                hit = (name, code)
+                break
+        if hit:
+            counts[hit] += 1
+        elif _is_latin(ch):
+            latin += 1
+    total = sum(counts.values()) + latin
+    if total == 0:
+        return {&quot;lang&quot;: None, &quot;method&quot;: &quot;script&quot;, &quot;script&quot;: None, &quot;confidence&quot;: 0.0,
+                &quot;note&quot;: &quot;no letters to detect from&quot;}
+    if counts:
+        (name, code), n = counts.most_common(1)[0]
+        share = round(n / total, 3)
+        if share &gt;= 0.5:
+            note = &quot;Devanagari is shared by hi, mr and ne&quot; if code == &quot;hi&quot; else &quot;&quot;
+            return {&quot;lang&quot;: code, &quot;method&quot;: &quot;script&quot;, &quot;script&quot;: name, &quot;confidence&quot;: share, &quot;note&quot;: note}
+    return {&quot;lang&quot;: None, &quot;method&quot;: &quot;script&quot;, &quot;script&quot;: &quot;Latin&quot;, &quot;confidence&quot;: round(latin / total, 3),
+            &quot;note&quot;: &quot;Latin script: cannot tell English, Spanish, French or German from script alone&quot;}
+
+
+def resolve(declared: str | None, detected: str | None) -&gt; tuple[str | None, list[str]]:
+    &quot;&quot;&quot;Return the language to use and any notes. Declared wins unless it is &#x27;auto&#x27; or missing.&quot;&quot;&quot;
+    notes: list[str] = []
+    decl = (declared or &quot;&quot;).strip().lower()
+    if decl and decl != &quot;auto&quot;:
+        if detected and detected != decl:
+            notes.append(f&quot;declared &#x27;{decl}&#x27; but detected &#x27;{detected}&#x27;; declared value used&quot;)
+        return decl, notes
+    if detected:
+        return detected, notes
+    notes.append(&quot;language undetermined; set it in the form if known&quot;)
+    return None, notes
+
+
+def detect_for_words(words: list[dict], language_field: str | None) -&gt; dict:
+    &quot;&quot;&quot;Use an explicit language field when present, otherwise fall back to script detection.&quot;&quot;&quot;
+    if language_field:
+        return {&quot;lang&quot;: language_field.lower(), &quot;method&quot;: &quot;provided&quot;, &quot;script&quot;: None,
+                &quot;confidence&quot;: 1.0, &quot;note&quot;: &quot;&quot;}
+    text = &quot; &quot;.join(w.get(&quot;word&quot;, &quot;&quot;) for w in words)
+    return detect_from_text(text)
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>core/manifest.py — Run Manifest Validator</h3>
+  <div class="desc">Loads and validates run_id, source video specs, and unique output identifiers against schema constraints.</div>
+  <pre><code>&quot;&quot;&quot;Read and validate a batch manifest.&quot;&quot;&quot;
+import json
+import re
+from pathlib import Path
+
+NAME_RE = re.compile(r&quot;^[a-z0-9_\-]+$&quot;)
+
+
+class ManifestError(ValueError):
+    pass
+
+
+def load_manifest(path: Path) -&gt; dict:
+    data = json.loads(Path(path).read_text(encoding=&quot;utf-8&quot;))
+    validate_manifest(data)
+    return data
+
+
+def validate_manifest(data: dict) -&gt; None:
+    for key in (&quot;run_id&quot;, &quot;source&quot;, &quot;target_lang&quot;, &quot;outputs&quot;):
+        if key not in data:
+            raise ManifestError(f&quot;missing key: {key}&quot;)
+    if not data[&quot;outputs&quot;]:
+        raise ManifestError(&quot;no outputs listed&quot;)
+    ids = set()
+    for o in data[&quot;outputs&quot;]:
+        for k in (&quot;output_id&quot;, &quot;vendor&quot;, &quot;file&quot;):
+            if k not in o:
+                raise ManifestError(f&quot;output missing {k}: {o}&quot;)
+        if not NAME_RE.match(o[&quot;output_id&quot;]):
+            raise ManifestError(f&quot;bad output_id (use lowercase, digits, _ or -): {o[&#x27;output_id&#x27;]}&quot;)
+        if o[&quot;output_id&quot;] in ids:
+            raise ManifestError(f&quot;duplicate output_id: {o[&#x27;output_id&#x27;]}&quot;)
+        ids.add(o[&quot;output_id&quot;])
+
+
+def example_manifest(run_id: str = &quot;20261030_131500_ms_clip01&quot;) -&gt; dict:
+    return {
+        &quot;run_id&quot;: run_id,
+        &quot;source&quot;: {&quot;file&quot;: &quot;src__en__clip01.mp4&quot;, &quot;lang&quot;: &quot;en&quot;},
+        &quot;target_lang&quot;: &quot;ms&quot;,
+        &quot;outputs&quot;: [
+            {&quot;output_id&quot;: &quot;heygen__ms__clip01&quot;, &quot;vendor&quot;: &quot;HeyGen&quot;, &quot;file&quot;: &quot;heygen__ms__clip01.mp4&quot;},
+            {&quot;output_id&quot;: &quot;sync__ms__clip01&quot;, &quot;vendor&quot;: &quot;Sync.so&quot;, &quot;file&quot;: &quot;sync__ms__clip01.mp4&quot;},
+            {&quot;output_id&quot;: &quot;framex__ms__clip01&quot;, &quot;vendor&quot;: &quot;FrameX&quot;, &quot;file&quot;: &quot;framex__ms__clip01.mp4&quot;},
+        ],
+    }
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>server/app.py — FastAPI Backend & REST Endpoints</h3>
+  <div class="desc">Asynchronous web server hosting the dashboard UI, handling multipart video uploads, polling status, and streaming reports.</div>
+  <pre><code>&quot;&quot;&quot;FastAPI backend and web UI.
+
+GET  /                             web UI (upload, platform choice, live log, report link)
+GET  /api/platforms                platform names from config/vendors.yaml, in display order
+POST /api/runs                     multipart: manifest + media files (+ optional precomputed JSON), mode, use_judge
+GET  /api/runs/{run_id}            status (queued / running / done / failed)
+GET  /api/runs/{run_id}/log?offset=N   log text written after byte offset N, plus the next offset
+GET  /api/runs/{run_id}/results    results.json
+GET  /api/runs/{run_id}/report     HTML report
+GET  /api/runs/{run_id}/report/{p} report assets (media copies)
+&quot;&quot;&quot;
+import json
+import logging
+import os
+import re
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+
+from core import pipeline
+from core.manifest import ManifestError, load_manifest
+from report import build_html
+
+ROOT = Path(__file__).resolve().parent.parent
+RUNS = Path(os.environ.get(&quot;RUNS_DIR&quot;, ROOT / &quot;runs&quot;))
+RUNS.mkdir(parents=True, exist_ok=True)
+RUN_ID_RE = re.compile(r&quot;^[A-Za-z0-9_\-]{3,80}$&quot;)
+STATIC = Path(__file__).resolve().parent / &quot;static&quot;
+LOG_NAME = &quot;run.log&quot;
+MAX_LOG_CHUNK = 256 * 1024
+
+app = FastAPI(title=&quot;DubQA v2&quot;, version=&quot;2.0&quot;)
+
+logging.basicConfig(level=logging.INFO, format=&quot;%(asctime)s %(levelname)s %(message)s&quot;)
+logging.getLogger(&quot;dubqa&quot;).setLevel(logging.INFO)
+
+
+def _run_dir(run_id: str) -&gt; Path:
+    if not RUN_ID_RE.match(run_id):
+        raise HTTPException(400, &quot;bad run_id&quot;)
+    d = RUNS / run_id
+    if not d.exists():
+        raise HTTPException(404, &quot;run not found&quot;)
+    return d
+
+
+class _ThreadFilter(logging.Filter):
+    &quot;&quot;&quot;Only lines logged by this run&#x27;s worker thread go into its run.log.&quot;&quot;&quot;
+
+    def __init__(self, thread_name: str):
+        super().__init__()
+        self.thread_name = thread_name
+
+    def filter(self, record: logging.LogRecord) -&gt; bool:
+        return record.threadName == self.thread_name
+
+
+def _job(run_dir: Path, mode: str, use_judge: bool, use_gemini: bool) -&gt; None:
+    thread_name = threading.current_thread().name
+    handler = logging.FileHandler(run_dir / LOG_NAME, encoding=&quot;utf-8&quot;)
+    handler.setFormatter(logging.Formatter(&quot;%(asctime)s %(levelname)s %(message)s&quot;))
+    handler.addFilter(_ThreadFilter(thread_name))
+    logger = logging.getLogger(&quot;dubqa&quot;)
+    logger.addHandler(handler)
+    try:
+        pipeline.run(run_dir, mode=mode, use_judge=use_judge, use_gemini=use_gemini)
+        build_html.build(run_dir)
+        logging.getLogger(&quot;dubqa&quot;).info(&quot;report built&quot;)
+    except Exception:
+        pass  # pipeline already wrote status=failed with the error, and the traceback is in run.log
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+
+@app.get(&quot;/&quot;, include_in_schema=False)
+def index():
+    return FileResponse(STATIC / &quot;index.html&quot;, media_type=&quot;text/html&quot;)
+
+
+@app.get(&quot;/api/platforms&quot;)
+def platforms():
+    data = yaml.safe_load((ROOT / &quot;config&quot; / &quot;vendors.yaml&quot;).read_text(encoding=&quot;utf-8&quot;)) or {}
+    items = data.get(&quot;vendors&quot;, {})
+    return [name for name, _ in sorted(items.items(), key=lambda kv: kv[1].get(&quot;order&quot;, 99))]
+
+
+@app.post(&quot;/api/runs&quot;, status_code=202)
+async def create_run(manifest: UploadFile = File(...), files: list[UploadFile] = File(...),
+                     mode: str = Form(&quot;precomputed&quot;), use_judge: bool = Form(False),
+                     use_gemini: bool = Form(True)):
+    if mode not in (&quot;precomputed&quot;, &quot;full&quot;):
+        raise HTTPException(400, &quot;mode must be precomputed or full&quot;)
+    raw = await manifest.read()
+    try:
+        data = json.loads(raw)
+        load_manifest_from_dict(data)
+    except (ValueError, ManifestError) as e:
+        raise HTTPException(400, f&quot;manifest invalid: {e}&quot;)
+    run_id = data[&quot;run_id&quot;]
+    if not RUN_ID_RE.match(run_id):
+        raise HTTPException(400, &quot;bad run_id in manifest&quot;)
+    run_dir = RUNS / run_id
+    if run_dir.exists():
+        raise HTTPException(409, &quot;run_id already exists&quot;)
+    for sub in (&quot;inputs&quot;, &quot;work&quot;, &quot;measure&quot;, &quot;judge&quot;, &quot;precomputed&quot;, &quot;report&quot;):
+        (run_dir / sub).mkdir(parents=True, exist_ok=True)
+    (run_dir / &quot;manifest.json&quot;).write_bytes(raw)
+    wanted = {data[&quot;source&quot;][&quot;file&quot;], *(o[&quot;file&quot;] for o in data[&quot;outputs&quot;])}
+    saved = []
+    for f in files:
+        name = Path(f.filename or &quot;&quot;).name
+        if not name or name != (f.filename or &quot;&quot;):
+            raise HTTPException(400, f&quot;bad file name: {f.filename}&quot;)
+        if name.endswith(&quot;.json&quot;):
+            dest = run_dir / &quot;precomputed&quot; / name
+        elif name in wanted:
+            dest = run_dir / &quot;inputs&quot; / name
+        else:
+            raise HTTPException(400, f&quot;unexpected file: {name}&quot;)
+        dest.write_bytes(await f.read())
+        saved.append(name)
+    missing = [w for w in wanted if w not in saved]
+    if missing:
+        raise HTTPException(400, f&quot;missing media files: {missing}&quot;)
+    _write_meta(run_dir, &quot;queued&quot;, mode=mode, created=datetime.now(timezone.utc).isoformat())
+    (run_dir / LOG_NAME).write_text(
+        f&quot;{datetime.now(timezone.utc).isoformat()} INFO run {run_id} queued (mode={mode})\n&quot;, encoding=&quot;utf-8&quot;)
+    t = threading.Thread(target=_job, args=(run_dir, mode, use_judge, use_gemini), name=f&quot;run-{run_id}&quot;, daemon=True)
+    t.start()
+    return {&quot;run_id&quot;: run_id, &quot;status&quot;: &quot;queued&quot;, &quot;status_url&quot;: f&quot;/api/runs/{run_id}&quot;}
+
+
+def load_manifest_from_dict(data: dict) -&gt; None:
+    from core.manifest import validate_manifest
+    validate_manifest(data)
+
+
+def _write_meta(run_dir: Path, status: str, **extra) -&gt; None:
+    p = run_dir / &quot;run_meta.json&quot;
+    meta = json.loads(p.read_text()) if p.exists() else {}
+    meta.update({&quot;status&quot;: status}, **extra)
+    p.write_text(json.dumps(meta, indent=2))
+
+
+@app.get(&quot;/api/runs/{run_id}&quot;)
+def status(run_id: str):
+    d = _run_dir(run_id)
+    p = d / &quot;run_meta.json&quot;
+    return json.loads(p.read_text()) if p.exists() else {&quot;status&quot;: &quot;queued&quot;}
+
+
+@app.get(&quot;/api/runs/{run_id}/log&quot;)
+def run_log(run_id: str, offset: int = Query(0, ge=0)):
+    p = _run_dir(run_id) / LOG_NAME
+    if not p.exists():
+        return {&quot;text&quot;: &quot;&quot;, &quot;offset&quot;: 0}
+    size = p.stat().st_size
+    start = min(offset, size)
+    with p.open(&quot;rb&quot;) as f:
+        f.seek(start)
+        chunk = f.read(MAX_LOG_CHUNK)
+    return {&quot;text&quot;: chunk.decode(&quot;utf-8&quot;, errors=&quot;replace&quot;), &quot;offset&quot;: start + len(chunk)}
+
+
+@app.get(&quot;/api/runs/{run_id}/results&quot;)
+def results(run_id: str):
+    p = _run_dir(run_id) / &quot;results.json&quot;
+    if not p.exists():
+        raise HTTPException(404, &quot;results not ready&quot;)
+    return JSONResponse(json.loads(p.read_text()))
+
+
+@app.get(&quot;/api/runs/{run_id}/report&quot;)
+def report(run_id: str):
+    p = _run_dir(run_id) / &quot;report&quot; / &quot;index.html&quot;
+    if not p.exists():
+        raise HTTPException(404, &quot;report not ready&quot;)
+    return FileResponse(p, media_type=&quot;text/html&quot;)
+
+
+@app.get(&quot;/api/runs/{run_id}/report/{asset:path}&quot;)
+def report_asset(run_id: str, asset: str):
+    base = (_run_dir(run_id) / &quot;report&quot;).resolve()
+    p = (base / asset).resolve()
+    if base not in p.parents or not p.is_file():
+        raise HTTPException(404, &quot;not found&quot;)
+    return FileResponse(p)
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>Dockerfile — Docker Container Definition</h3>
+  <div class="desc">Container build file with FFmpeg, Linux OpenGL graphics dependencies (libgl1, libegl1), and Python ML requirements.</div>
+  <pre><code>FROM python:3.11-slim
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+    ffmpeg libgl1 libglib2.0-0 libegl1 libgles2 libgl1-mesa-glx libgl1-mesa-dri \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt requirements-ml.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements-ml.txt
+COPY . .
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+CMD [&quot;uvicorn&quot;, &quot;server.app:app&quot;, &quot;--host&quot;, &quot;0.0.0.0&quot;, &quot;--port&quot;, &quot;8000&quot;]
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>docker-compose.yml — Docker Compose Service Topology</h3>
+  <div class="desc">Port mappings (8000:8000), volume mounts for runs/, and environment file bindings.</div>
+  <pre><code>services:
+  api:
+    build:
+      context: .
+      args:
+        WITH_ML: &quot;${WITH_ML:-0}&quot;
+    ports:
+      - &quot;8000:8000&quot;
+    env_file: .env
+    volumes:
+      - ./runs:/app/runs
+    restart: unless-stopped
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>requirements.txt — Core Python Dependencies</h3>
+  <div class="desc">FastAPI, Uvicorn, Google GenAI SDK, NumPy, SciPy, PyYAML, Jinja2, Pytest.</div>
+  <pre><code>numpy&gt;=1.26
+scipy&gt;=1.11
+pyyaml&gt;=6.0
+jinja2&gt;=3.1
+fastapi&gt;=0.110
+uvicorn&gt;=0.29
+python-multipart&gt;=0.0.9
+openpyxl&gt;=3.1
+pytest&gt;=8.0
+google-genai&gt;=0.3
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>requirements-ml.txt — Machine Learning Dependencies</h3>
+  <div class="desc">Google MediaPipe, OpenCV-headless for vision processing.</div>
+  <pre><code># Heavy models for full video processing.
+mediapipe&gt;=0.10
+opencv-python-headless&gt;=4.9
+google-genai&gt;=0.3
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>config/thresholds.yaml — Metric Weights & Threshold Gates</h3>
+  <div class="desc">Defines Good/Bad pass tolerances, metric group weightings, and release gate rules.</div>
+  <pre><code># Single threshold set used by the whole pipeline. Version it when changed.
+version: &quot;2.0&quot;
+metrics:
+  translation_fidelity:   {label: &quot;Translation fidelity (%)&quot;,     direction: min, good: 85,  check: 75,  group: meaning}
+  word_count_diff:        {label: &quot;Word-count difference (%)&quot;,    direction: max, good: 10,  check: 20,  group: words}
+  syllable_ratio:         {label: &quot;Speech-length ratio&quot;,          direction: band, low: 0.85, high: 1.15, check_low: 0.75, check_high: 1.25, group: words}
+  timing_drift_ms:        {label: &quot;Timing drift (ms)&quot;,            direction: max, good: 200, check: 400, group: words}
+  onset_drift_ms:         {label: &quot;Mouth-onset drift (ms)&quot;,       direction: max_abs, good: 80, check: 150, group: lipsync}
+  tail_drift_ms:          {label: &quot;Mouth-tail drift (ms)&quot;,        direction: max_abs, good: 80, check: 150, group: lipsync}
+  open_ratio_pct:         {label: &quot;Mouth open during speech (%)&quot;, direction: min, good: 80, check: 65, group: lipsync}
+  false_movement_pct:     {label: &quot;False mouth movement (%)&quot;,     direction: max, good: 5,   check: 10,  group: lipsync}
+  word_pass_rate_pct:     {label: &quot;Word lip-sync pass rate (%)&quot;,  direction: min, good: 85,  check: 70,  group: lipsync}
+  emotion_match_pct:      {label: &quot;Emotion match (%)&quot;,            direction: min, good: 75,  check: 60,  group: voice}
+  tone_match_pct:         {label: &quot;Tone match (%)&quot;,               direction: min, good: 70,  check: 55,  group: voice}
+  audio_quality:          {label: &quot;Audio clarity (0-10)&quot;,         direction: min, good: 7.0, check: 5.5, group: voice}
+  missing_sentences:      {label: &quot;Missing sentences&quot;,            direction: max, good: 0,   check: 1,   group: meaning}
+  hallucinations:         {label: &quot;Hallucinations&quot;,               direction: max, good: 0,   check: 0,   group: meaning}
+# Weights for the overall score. Missing metrics are excluded and reported as coverage.
+group_weights: {meaning: 30, words: 20, lipsync: 20, voice: 15, audio: 15}
+release_gate:
+  min_overall: 85
+  max_missing_coverage_pct: 30
+# Tie tolerances for pairwise comparison (same units as the metric).
+tie_tolerance:
+  translation_fidelity: 2
+  word_count_diff: 2
+  syllable_ratio: 0.05
+  timing_drift_ms: 20
+  onset_drift_ms: 20
+  tail_drift_ms: 20
+  open_ratio_pct: 2
+  false_movement_pct: 2
+  word_pass_rate_pct: 2
+  emotion_match_pct: 2
+  tone_match_pct: 2
+  audio_quality: 0.5
+  missing_sentences: 0
+  hallucinations: 0
+</code></pre>
+</section>
+
+<section style="margin-bottom: 40px;">
+  <h3>config/vendors.yaml — Vendor Labels & Display Metadata</h3>
+  <div class="desc">Labels and platform identifiers for HeyGen, Sync.so, Synthesia, and FrameX.</div>
+  <pre><code># Vendor names are taken from the manifest; this file only maps display colours and order.
+vendors:
+  HeyGen:    {order: 1}
+  Synthesia: {order: 2}
+  Sync.so:   {order: 3}
+  FrameX:    {order: 4}
+</code></pre>
+</section>
+</body></html>

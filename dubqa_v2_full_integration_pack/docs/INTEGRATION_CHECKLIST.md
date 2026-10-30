@@ -1,0 +1,21 @@
+# Integration Checklist
+
+- [ ] Baseline tests run and saved.
+- [ ] Existing `core/asr.py` and model requirements reconciled.
+- [ ] Multi-face support added without breaking single-face mode.
+- [ ] Speaker diarization and face mapping separated; uncertain matches REVIEW.
+- [ ] Target-language reference path implemented.
+- [ ] Missing word/sentence/extra/repetition scenarios validated with synthetic truth.
+- [ ] Phoneme alignment marked NOT_MEASURED unless a real aligner is active.
+- [ ] Audio quality measurements added and individually documented.
+- [ ] SRT/VTT parsing and caption timing checks added.
+- [ ] `scenario_results` and `defects` included in results.json.
+- [ ] Excel workbook created for every completed run.
+- [ ] Word report generated from the workbook.
+- [ ] API download endpoints added for XLSX and DOCX.
+- [ ] Docker `WITH_ML` build arg actually controls ML install.
+- [ ] Model cache volume persists across restarts.
+- [ ] Secret removed/rotated and `.env` ignored.
+- [ ] Public summary is opt-in, sanitized and reviewed.
+- [ ] Existing tests and new tests pass.
+- [ ] Docker smoke test completed.
