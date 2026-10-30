@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from core import align, asr, judge_gemini, lang, lips, media, pairwise, scoring, timing, vad
+from core import audio_quality, captions, scenarios
 from core import info as ginfo
 from core.manifest import load_manifest
 
@@ -166,6 +167,41 @@ def run(run_dir: Path, mode: str = "precomputed", use_judge: bool = False, use_g
         cmp = pairwise.compare_all(values_by_out, th)
         results["pairs"] = cmp["pairs"]
         results["win_matrix"] = cmp["win_matrix"]
+
+        # Run Audio Quality, Captions and Scenarios across all outputs
+        audio_qualities = {}
+        captions_data = {}
+        for o in man["outputs"]:
+            oid = o["output_id"]
+            wav_p = work / f"{oid}.wav"
+            aq = audio_quality.measure_audio_quality(wav_p)
+            audio_qualities[oid] = aq
+            results["outputs"][oid]["audio_quality"] = aq
+
+            # Check if captions exist (srt or vtt in inputs)
+            cap_candidates = [inputs / f"{oid}.srt", inputs / f"{oid}.vtt", inputs / f"{Path(o['file']).stem}.srt"]
+            cap_path = next((cp for cp in cap_candidates if cp.exists()), None)
+            cdata = captions.evaluate_captions(cap_path)
+            captions_data[oid] = cdata
+            results["outputs"][oid]["captions"] = cdata
+
+        sc_results, defects = scenarios.run_scenario_evaluations(results["outputs"], audio_qualities, captions_data, run_dir)
+        results["scenario_results"] = sc_results
+        results["defects"] = defects
+        results["scenario_counts"] = {
+            "pass": sum(1 for s in sc_results if s["status"] == "PASS"),
+            "fail": sum(1 for s in sc_results if s["status"] == "FAIL"),
+            "review": sum(1 for s in sc_results if s["status"] == "REVIEW"),
+            "not_measured": sum(1 for s in sc_results if s["status"] == "NOT_MEASURED"),
+        }
+        results["defect_counts"] = {
+            "critical": sum(1 for d in defects if d["severity"] == "CRITICAL"),
+            "high": sum(1 for d in defects if d["severity"] == "HIGH"),
+            "medium": sum(1 for d in defects if d["severity"] == "MEDIUM"),
+            "low": sum(1 for d in defects if d["severity"] == "LOW"),
+        }
+        results["overall_status"] = "FAIL" if results["defect_counts"]["critical"] > 0 else "PASS"
+
         _write(run_dir / "results.json", results)
         _status(run_dir, "done")
         log.info("run finished")

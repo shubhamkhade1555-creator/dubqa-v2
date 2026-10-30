@@ -29,7 +29,9 @@ def build(run_dir: Path) -> Path:
     tpl = env.get_template("report.html")
     lips = {}
     for oid in res["outputs"]:
-        p = run_dir / "precomputed" / f"{oid}_lips.json"
+        p = run_dir / "lips" / f"{oid}_lips.json"
+        if not p.exists():
+            p = run_dir / "precomputed" / f"{oid}_lips.json"
         if p.exists():
             lips[oid] = json.loads(p.read_text(encoding="utf-8")).get("opening", [])
     th = scoring.load_thresholds()

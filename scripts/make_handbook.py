@@ -80,3 +80,4 @@ parts.append("</body></html>")
 out_file = Path("dubqa_v2_complete_handbook.html")
 out_file.write_text("".join(parts), encoding="utf-8")
 print(f"Generated handbook with {len(files_to_pack)} modules at {out_file.resolve()}")
+

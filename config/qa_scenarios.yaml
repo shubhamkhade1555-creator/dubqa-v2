@@ -1,0 +1,36 @@
+version: "1.0"
+status_values: [PASS, FAIL, REVIEW, NOT_MEASURED]
+scenarios:
+  - {id: LS-01, category: lipsync, title: Single-speaker baseline, severity: high, description: Verify word timing and visible mouth activity for a clear frontal speaker.}
+  - {id: LS-02, category: lipsync, title: Late mouth onset, severity: high, description: Detect mouth movement beginning after the spoken word.}
+  - {id: LS-03, category: lipsync, title: Early mouth onset, severity: medium, description: Detect mouth movement beginning before speech.}
+  - {id: LS-04, category: lipsync, title: Early mouth end, severity: high, description: Detect mouth closing before the speech interval ends.}
+  - {id: LS-05, category: lipsync, title: Late mouth end, severity: medium, description: Detect mouth movement continuing after speech ends.}
+  - {id: LS-06, category: lipsync, title: Long-sentence drift, severity: high, description: Measure timing drift across a long utterance.}
+  - {id: LS-07, category: lipsync, title: Silence false movement, severity: medium, description: Detect sustained speech-like mouth activity during verified silence.}
+  - {id: LS-08, category: lipsync, title: Multiple visible faces, severity: critical, description: Associate active speaker evidence with the correct face track.}
+  - {id: LS-09, category: lipsync, title: Speaker handover, severity: critical, description: Verify face/speaker mapping changes at a diarized speaker change.}
+  - {id: LS-10, category: lipsync, title: Camera cut, severity: high, description: Prevent stale face track association across scene cuts.}
+  - {id: LS-11, category: lipsync, title: Face occlusion, severity: medium, description: Return REVIEW when mouth evidence is obscured.}
+  - {id: LS-12, category: lipsync, title: Off-screen speaker, severity: medium, description: Do not force an on-screen face assignment for off-screen speech.}
+  - {id: LS-13, category: lipsync, title: Overlapping speakers, severity: critical, description: Handle simultaneous speech without collapsing speaker intervals.}
+  - {id: LS-14, category: lipsync, title: Fast speech, severity: high, description: Evaluate word timing and tracking at high speech rate.}
+  - {id: LS-15, category: lipsync, title: Side profile, severity: medium, description: Assess face visibility and mouth landmark confidence in profile.}
+  - {id: WC-01, category: completeness, title: One missing word, severity: high, description: Detect one omitted target-language word against approved reference.}
+  - {id: WC-02, category: completeness, title: Multiple missing words, severity: high, description: Detect multiple omissions in one sentence.}
+  - {id: WC-03, category: completeness, title: Missing sentence, severity: critical, description: Detect an entire omitted sentence.}
+  - {id: WC-04, category: completeness, title: Truncated beginning, severity: high, description: Detect speech missing from sentence start.}
+  - {id: WC-05, category: completeness, title: Truncated ending, severity: high, description: Detect cut-off sentence ending.}
+  - {id: WC-06, category: completeness, title: Extra word, severity: medium, description: Detect unrequested inserted words.}
+  - {id: WC-07, category: completeness, title: Repeated word, severity: medium, description: Detect repeated word or phrase.}
+  - {id: WC-08, category: completeness, title: Critical entity or negation changed, severity: critical, description: Detect changed name, number, measurement or polarity.}
+  - {id: TQ-01, category: translation, title: Semantic meaning preserved, severity: high, description: Compare source meaning, expected target and actual dub transcript.}
+  - {id: TQ-02, category: translation, title: Grammar and naturalness, severity: medium, description: Review target-language fluency and grammar.}
+  - {id: TQ-03, category: translation, title: Technical terminology, severity: high, description: Verify domain-specific terms against approved glossary.}
+  - {id: AQ-01, category: audio, title: Background noise, severity: medium, description: Estimate noise/SNR when valid and request listening review.}
+  - {id: AQ-02, category: audio, title: Clipping and distortion, severity: high, description: Measure clipped samples and flag audible distortion for review.}
+  - {id: AQ-03, category: audio, title: Loudness and true peak, severity: medium, description: Measure integrated LUFS and true peak when meter is available.}
+  - {id: AQ-04, category: audio, title: Speech gap or abrupt cut, severity: high, description: Detect suspicious silence/gaps against expected speech.}
+  - {id: SP-01, category: speaker, title: Listener reaction not active speaker, severity: critical, description: Do not label a reacting listener as the speaker.}
+  - {id: CC-01, category: captions, title: Missing or mistimed caption, severity: medium, description: Compare SRT/VTT cues with target speech intervals.}
+  - {id: VI-01, category: video, title: Black/frozen/corrupt frames, severity: high, description: Detect decode errors, black frames and frozen frames.}

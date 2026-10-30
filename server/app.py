@@ -69,7 +69,13 @@ def _job(run_dir: Path, mode: str, use_judge: bool, use_gemini: bool) -> None:
     try:
         pipeline.run(run_dir, mode=mode, use_judge=use_judge, use_gemini=use_gemini)
         build_html.build(run_dir)
-        logging.getLogger("dubqa").info("report built")
+        logging.getLogger("dubqa").info("html report built")
+        try:
+            from core.qa_report_bundle import export_run_reports
+            export_run_reports(run_dir)
+            logging.getLogger("dubqa").info("excel and word reports built")
+        except Exception as rep_err:
+            logging.getLogger("dubqa").warning("excel/word report generation error: %s", rep_err)
     except Exception:
         pass  # pipeline already wrote status=failed with the error, and the traceback is in run.log
     finally:
@@ -181,6 +187,24 @@ def report(run_id: str):
     if not p.exists():
         raise HTTPException(404, "report not ready")
     return FileResponse(p, media_type="text/html")
+
+
+@app.get("/api/runs/{run_id}/report/excel")
+def report_excel(run_id: str):
+    p = _run_dir(run_id) / "report" / "QA_Results.xlsx"
+    if not p.exists():
+        raise HTTPException(404, "Excel workbook not ready")
+    return FileResponse(p, filename=f"{run_id}_QA_Results.xlsx",
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.get("/api/runs/{run_id}/report/word")
+def report_word(run_id: str):
+    p = _run_dir(run_id) / "report" / "QA_Report.docx"
+    if not p.exists():
+        raise HTTPException(404, "Word report not ready")
+    return FileResponse(p, filename=f"{run_id}_QA_Report.docx",
+                        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
 
 @app.get("/api/runs/{run_id}/report/{asset:path}")
